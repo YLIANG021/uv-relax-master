@@ -884,6 +884,9 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536):
     lab = np.zeros(n, np.int64) if lab is None else np.asarray(lab)[f]
     mv = None if moved is None else np.asarray(moved)[f]
     box = np.stack([t.min(1), t.max(1)], 1)
+    edge_vectors = np.stack([t[:, 1] - t[:, 0], t[:, 2] - t[:, 1],
+                             t[:, 0] - t[:, 2]], 1)
+    edge_normals = np.stack([-edge_vectors[..., 1], edge_vectors[..., 0]], -1)
     # each face's own size, from its area: the edge of an equilateral triangle of double area S is
     # sqrt(2 S / sqrt 3)
     scale = np.sqrt(2.0 * np.abs(area2[f]) / 1.7320508) + 1e-30
@@ -914,10 +917,7 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536):
         for s in range(0, len(ii), block):
             pa, pb = a[ii[s:s + block]], b[ii[s:s + block]]
             ta, tb = t[pa], t[pb]
-            da = np.stack([ta[:, 1] - ta[:, 0], ta[:, 2] - ta[:, 1], ta[:, 0] - ta[:, 2]], 1)
-            db = np.stack([tb[:, 1] - tb[:, 0], tb[:, 2] - tb[:, 1], tb[:, 0] - tb[:, 2]], 1)
-            ax = np.concatenate([np.stack([-da[..., 1], da[..., 0]], 2),
-                                 np.stack([-db[..., 1], db[..., 0]], 2)], 1)
+            ax = np.concatenate([edge_normals[pa], edge_normals[pb]], 1)
             ga = np.einsum("pnc,pkc->pnk", ta, ax)
             gb = np.einsum("pnc,pkc->pnk", tb, ax)
             gap = np.minimum(ga.max(1), gb.max(1)) - np.maximum(ga.min(1), gb.min(1))

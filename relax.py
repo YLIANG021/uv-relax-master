@@ -15,17 +15,6 @@ def _inside_out(signs):
     return int((s != (1.0 if s.sum() >= 0.0 else -1.0)).sum())
 
 
-def _weighted_quantile(values, weights, quantile):
-    order = np.argsort(values)
-    values = values[order]
-    weights = weights[order]
-    cumulative = np.cumsum(weights)
-    if not len(values) or cumulative[-1] <= 0.0:
-        return 0.0
-    index = np.searchsorted(cumulative, quantile * cumulative[-1], side="left")
-    return float(values[min(index, len(values) - 1)])
-
-
 def _density_stats(density, area3d):
     """3D-area-weighted density CV and percentile-to-median ratios."""
     valid = np.isfinite(density) & np.isfinite(area3d) & (area3d > 1e-30)
@@ -36,9 +25,17 @@ def _density_stats(density, area3d):
     mean = float(np.average(values, weights=weights))
     variance = float(np.average((values - mean) ** 2, weights=weights))
     cv = np.sqrt(max(variance, 0.0)) / max(mean, 1e-30)
-    median = _weighted_quantile(values, weights, 0.5)
-    p90 = _weighted_quantile(values, weights, 0.9)
-    p99 = _weighted_quantile(values, weights, 0.99)
+    order = np.argsort(values)
+    sorted_values = values[order]
+    cumulative = np.cumsum(weights[order])
+
+    def quantile(q):
+        index = np.searchsorted(cumulative, q * cumulative[-1], side="left")
+        return float(sorted_values[min(index, len(sorted_values) - 1)])
+
+    median = quantile(0.5)
+    p90 = quantile(0.9)
+    p99 = quantile(0.99)
     median = max(median, 1e-30)
     return float(cv), p90 / median, p99 / median
 
@@ -295,22 +292,27 @@ class UVRELAX_OT_relax(bpy.types.Operator):
 
         post_t0 = time.perf_counter()
         p, a3 = core.uv3d(co, tri)
-        shape0, k0 = core.face_metric(p, tuv)
-        shape1, k1 = core.face_metric(p, new_loop_uv[lt])
+        metric_t0 = time.perf_counter()
+        metric_prep = core.face_metric_prep(p)
+        shape0, k0 = core.face_metric_uv(metric_prep, tuv)
+        shape1, k1 = core.face_metric_uv(metric_prep, new_loop_uv[lt])
         density0 = _density_stats(k0[scope], a3[scope])
         density1 = _density_stats(k1[scope], a3[scope])
         was = float((k0[scope] * a3[scope]).sum())
         now = float((k1[scope] * a3[scope]).sum())
         turn0 = _inside_out(core.signed_uv_area(tuv)[scope])
         turn1 = _inside_out(core.signed_uv_area(new_loop_uv[lt])[scope])
+        metric_ms = (time.perf_counter() - metric_t0) * 1000.0
         # the energy asks each face to be a good similarity of itself and is content with two of
         # them sharing one patch of the map, so evenness and zero folds do not add up to an
         # unoverlapped island; what is left over is counted and said, not priced into the solve.
         # Every face of the mesh is looked at, not just the ones in scope, because an outline that
         # may move can grow into a neighbour that was never touched -- and a pair is only charged
         # against this button where one of its two faces sits on an island this button wrote back.
+        overlap_t0 = time.perf_counter()
         within, across = core.overlapping_pairs(inv, pos, isl,
                                                 moved=np.isin(isl, moved_labs))
+        overlap_ms = (time.perf_counter() - overlap_t0) * 1000.0
         tail = ""
         if declined:
             tail += " | %d island(s) left alone: %d face(s) in them are turned the way round " \
@@ -336,10 +338,12 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         ms = (time.perf_counter() - t0) * 1000.0
         _console_log(
             "DONE object=%s elapsed_ms=%.1f read_ms=%.1f setup_ms=%.1f solve_ms=%.1f "
-            "write_ms=%.1f post_ms=%.1f selected_verts=%d selected_edges=%d "
+            "write_ms=%.1f post_ms=%.1f metric_ms=%.1f overlap_ms=%.1f "
+            "selected_verts=%d selected_edges=%d "
             "selected_faces=%d islands=%d relaxed_islands=%d points=%d solves=%d "
             "cg_passes=%d steps=%d density=%.3f hold_border=%s" %
             (context.active_object.name, ms, read_ms, setup_ms, solve_ms, write_ms, post_ms,
+             metric_ms, overlap_ms,
              selection["verts"], selection["edges"], selection["faces"], len(labs), relaxed, points, solves, took,
              int(self.steps), float(self.density_weight), bool(self.pin_border)))
         self.report({"WARNING" if (declined or stuck or ran_out or within or across) else "INFO"},
