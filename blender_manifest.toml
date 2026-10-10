@@ -1,0 +1,14 @@
+schema_version = "1.0.0"
+
+id = "uv_relax"
+version = "1.0.0"
+name = "UV Relax"
+tagline = "Relax part of a UV island without moving what you didn't select"
+maintainer = "TODO <todo@example.com>"
+type = "add-on"
+
+tags = ["UV"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
