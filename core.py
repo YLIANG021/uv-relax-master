@@ -357,6 +357,20 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             np.add.at(out, boundary_edges[:, 1], gs[:, 1])
         return out
 
+    def scatter_blocks(gs):
+        """Sum per-face 2x2 corner blocks (T,3,2,2) onto island points."""
+        out = np.zeros((V, 2, 2))
+        np.add.at(out, tl.ravel(), gs.reshape(-1, 2, 2))
+        return out
+
+    def scatter_edge_blocks(gs):
+        """Sum per-boundary-edge 2x2 endpoint blocks (E,2,2,2) onto island points."""
+        out = np.zeros((V, 2, 2))
+        if len(boundary_edges):
+            ids = boundary_edges.ravel()
+            np.add.at(out, ids, gs.reshape(-1, 2, 2))
+        return out
+
     def ask(e_side):
         """An orientation trial's fixed coefficients: every face asked for `e_side` (+1, -1) or for
         the way round it already is (None)."""
@@ -466,22 +480,31 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 out = out + scatter_edges((2.0 * wb * db)[:, None, None] * Lb)
             return out
 
-        dg = 2.0 * w[:, None, None] * (A[:, 0] ** 2 + A[:, 1] ** 2)
+        face_blocks = 2.0 * w[:, None, None, None] * np.einsum(
+            "tkci,tkcj->tcij", A, A)
+        dg = np.diagonal(face_blocks, axis1=2, axis2=3)
         c0 = np.zeros((V, 2))
         if dens:
             L, r = density_lin(signs, base)
             wd = density_weight * weight
             lin = (L, r)
             c0 = scatter((-2.0 * wd * r)[:, None, None] * L)
-            dg = dg + (2.0 * wd)[:, None, None] * L * L
+            density_blocks = (2.0 * wd)[:, None, None, None] * np.einsum(
+                "tci,tcj->tcij", L, L)
+            face_blocks = face_blocks + density_blocks
+            dg = dg + np.diagonal(density_blocks, axis1=2, axis2=3)
 
         if len(boundary_edges):
             Lb, rb = boundary_lin(base)
             wb = boundary_weights * boundary_factor
             blin = (Lb, rb)
             c0 = c0 + scatter_edges((-2.0 * wb * rb)[:, None, None] * Lb)
-            dg_b = (2.0 * wb)[:, None, None] * Lb * Lb
+            boundary_blocks = (2.0 * wb)[:, None, None, None] * np.einsum(
+                "eai,eaj->eaij", Lb, Lb)
+            dg_b = np.diagonal(boundary_blocks, axis1=2, axis2=3)
             boundary_diag = scatter_edges(dg_b)
+        else:
+            boundary_blocks = np.zeros((0, 2, 2, 2))
 
         def value(u):
             d = np.einsum("tkcv,tcv->tk", A, u[tl])
@@ -494,7 +517,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 e += float((wb * (np.einsum("eij,eij->e", Lb, u[boundary_edges]) - off_b) ** 2).sum())
             return e
 
-        return hvp, scatter(dg) + boundary_diag, c0, value
+        block_diag = scatter_blocks(face_blocks) + scatter_edge_blocks(boundary_blocks)
+        return hvp, scatter(dg) + boundary_diag, c0, value, block_diag
 
     def energy(A, w, signs, u, dens):
         """The objective itself rather than its local stand-in, so successive Gauss-Newton steps can
@@ -540,7 +564,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         scale_gauge = (uv0 - uv0.mean(0))[:, :, None]
     # which points may move is worked out once, before any solve, and shared by both questions below:
     # a point no live triangle sits on has no stiffness and nothing to be even about
-    _, stiff, _, _ = system(*ask(maj), uv0, False)
+    _, stiff, _, _, _ = system(*ask(maj), uv0, False)
     held = pin | (stiff.min(1) <= 0.0)
 
     stats = {"free": int((~held).sum()), "pass": 0, "solve": 0, "gain": 0.0, "why": "relaxed",
@@ -568,7 +592,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         """
         if model is None:
             model = system(A, w, signs, base, dens)
-        hvp, diag, c0, _ = model
+        hvp, diag, c0, _, block_diag = model
         live = (~held & ~clamp)[:, None]
         basis = None
         if gauge is not None and not clamp.any():
@@ -603,14 +627,40 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         g = project(hvp(base) + c0)
         g0 = float(np.linalg.norm(g))
         inv_diag = live / np.maximum(diag, 1e-30)
+        block_inv = np.zeros_like(block_diag)
+        active = live[:, 0]
+        if active.any():
+            blocks = block_diag[active]
+            scale = np.maximum(np.max(np.abs(blocks), axis=(1, 2)), 1e-30)
+            det = blocks[:, 0, 0] * blocks[:, 1, 1] - blocks[:, 0, 1] * blocks[:, 1, 0]
+            good = det > 1e-12 * scale * scale
+            if good.any():
+                selected = blocks[good]
+                inv_det = 1.0 / det[good]
+                inverse = np.empty_like(selected)
+                inverse[:, 0, 0] = selected[:, 1, 1] * inv_det
+                inverse[:, 1, 1] = selected[:, 0, 0] * inv_det
+                inverse[:, 0, 1] = -selected[:, 0, 1] * inv_det
+                inverse[:, 1, 0] = -selected[:, 1, 0] * inv_det
+                active_ids = np.flatnonzero(active)
+                block_inv[active_ids[good]] = inverse
+
+        def precondition(v):
+            """Apply a per-UV-point 2x2 Jacobi block, with scalar fallback for flat points."""
+            out = np.einsum("vij,vj->vi", block_inv, v)
+            fallback = active & (np.max(np.abs(block_inv), axis=(1, 2)) <= 0.0)
+            if fallback.any():
+                out[fallback] = v[fallback] * inv_diag[fallback]
+            return out * live
+
         r = project(-g)
         # what the model says is left to win; when that is nothing the island is already standing
         # where this solve would put it, and there is no iteration worth spending
-        if 0.5 * float((r * r * inv_diag).sum()) <= 1e-12 * max(energy(A, w, signs, base, dens),
-                                                                1e-30):
+        if 0.5 * float((r * precondition(r)).sum()) <= 1e-12 * max(
+                energy(A, w, signs, base, dens), 1e-30):
             return base.copy(), 0, False, np.zeros((V, 2))
         x = np.zeros((V, 2))
-        z = project(r * inv_diag)
+        z = project(precondition(r))
         dirn = z.copy()
         rz = float((r * z).sum())
         cap = max(1, int(maxit))
@@ -635,14 +685,14 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 check = float(np.linalg.norm(rt))
                 if abs(check - rn) > 0.5 * check:
                     r = rt
-                    z = project(r * inv_diag)
+                    z = project(precondition(r))
                     dirn = z.copy()
                     rz = float((r * z).sum())
                     continue
             if check <= tol * g0:
                 out = False
                 break
-            z = project(r * inv_diag)
+            z = project(precondition(r))
             rz_new = float((r * z).sum())
             dirn = project(z + (rz_new / rz) * dirn)
             rz = rz_new
