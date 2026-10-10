@@ -560,13 +560,15 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         cen = v.mean(0)
         return (v - cen) * np.sqrt(area2_0 / now) + cen
 
-    def solve(A, w, signs, clamp, base, dens, tol=1e-6):
+    def solve(A, w, signs, clamp, base, dens, tol=1e-6, model=None):
         """One global move over every point not held by selection or a fold clamp.
 
         On a loose island, each Krylov vector is projected off the four global similarity modes.
         This fixes the numerical gauge without fixing any physical boundary vertex.
         """
-        hvp, diag, c0, _ = system(A, w, signs, base, dens)
+        if model is None:
+            model = system(A, w, signs, base, dens)
+        hvp, diag, c0, _ = model
         live = (~held & ~clamp)[:, None]
         basis = None
         if gauge is not None and not clamp.any():
@@ -574,20 +576,28 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         elif scale_gauge is not None:
             basis = scale_gauge
 
-        def project(v):
-            v = v * live
-            if basis is None:
-                return v
+        # Build the small projection basis once per linear solve.  The old path recomputed a
+        # least-squares fit over every UV point for every CG vector; the basis is fixed while this
+        # solve runs, so a QR factorization gives the same orthogonal projection with two cheap
+        # matrix-vector products per iteration.
+        projector = None
+        if basis is not None:
             active = live[:, 0]
             M = basis[active].reshape(-1, basis.shape[2])
+            if len(M):
+                Q, _ = np.linalg.qr(M, mode="reduced")
+                projector = Q
+
+        def project(v):
+            v = v * live
+            if projector is None:
+                return v
+            active = live[:, 0]
             flat = v[active].reshape(-1)
             if len(flat) == 0:
                 return v
-            # The four columns are independent for any non-degenerate island.  lstsq also handles
-            # a nearly collapsed selection without introducing a new hard vertex constraint.
-            coeff, _, _, _ = np.linalg.lstsq(M, flat, rcond=1e-12)
             out = v.copy()
-            out[active] = (flat - M @ coeff).reshape(-1, 2)
+            out[active] = (flat - projector @ (projector.T @ flat)).reshape(-1, 2)
             return out
 
         g = project(hvp(base) + c0)
@@ -692,8 +702,10 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             the linearization reached, and a round costs one conjugate-gradient solve."""
             base = base_at
             for _ in range(density_refine):
-                _, _, _, value = system(A, w, signs, base, True)
-                cand, iters, hit, x = solve(A, w, signs, clamp_at, base, True, tol=density_tol)
+                model = system(A, w, signs, base, True)
+                value = model[3]
+                cand, iters, hit, x = solve(
+                    A, w, signs, clamp_at, base, True, tol=density_tol, model=model)
                 note(iters, hit)
                 if iters == 0:
                     break
