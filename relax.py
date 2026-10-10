@@ -102,6 +102,7 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             return {"CANCELLED"}
         co, tri, lt, uvs, loops, uvl, poly_of_tri = got
         tuv = uvs[lt]
+        read_ms = (time.perf_counter() - t0) * 1000.0
 
         inv = core.uvvert_ids(tri, tuv)
         U = int(inv.max()) + 1
@@ -138,6 +139,7 @@ class UVRELAX_OT_relax(bpy.types.Operator):
              selection["verts"], selection["edges"], selection["faces"],
              int(scope.sum()), len(labs), int(self.steps), float(self.density_weight),
              bool(self.pin_border)))
+        setup_ms = (time.perf_counter() - t0) * 1000.0 - read_ms
 
         pos = np.zeros((U, 2))
         pos[inv.ravel()] = tuv.reshape(-1, 2)
@@ -161,6 +163,7 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         # faces only, so an island that was already stamped over a neighbour before the button was
         # pressed is not reported as this button's work
         moved_labs = []
+        solve_t0 = time.perf_counter()
         for lab in labs:
             f = np.flatnonzero(isl == lab)
             ids = np.unique(inv[f])
@@ -275,17 +278,22 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             self.report({"WARNING" if (stuck or declined) else "INFO"},
                         "Nothing relaxed: " + ", ".join(why))
             _console_log(
-                "CANCEL object=%s reason=nothing_relaxed elapsed_ms=%.1f islands=%d "
-                "solves=%d cg_passes=%d" %
+                "CANCEL object=%s reason=nothing_relaxed elapsed_ms=%.1f read_ms=%.1f "
+                "setup_ms=%.1f solve_ms=%.1f islands=%d solves=%d cg_passes=%d" %
                 (context.active_object.name, (time.perf_counter() - t0) * 1000.0,
+                 read_ms, setup_ms, (time.perf_counter() - solve_t0) * 1000.0,
                  len(labs), solves, took))
             return {"CANCELLED"}
 
+        solve_ms = (time.perf_counter() - solve_t0) * 1000.0
+        write_t0 = time.perf_counter()
         new_loop_uv = np.empty_like(uvs)
         new_loop_uv[lt.ravel()] = pos[inv.ravel()]
         bridge.write(loops, uvl, new_loop_uv)
         bmesh.update_edit_mesh(me)
+        write_ms = (time.perf_counter() - write_t0) * 1000.0
 
+        post_t0 = time.perf_counter()
         p, a3 = core.uv3d(co, tri)
         shape0, k0 = core.face_metric(p, tuv)
         shape1, k1 = core.face_metric(p, new_loop_uv[lt])
@@ -324,13 +332,15 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             tail += " | %d face pair(s) now lie on top of a neighbouring island, because a border " \
                     "that was allowed to move took the room -- repack, or turn Hold Border on" \
                     % across
+        post_ms = (time.perf_counter() - post_t0) * 1000.0
         ms = (time.perf_counter() - t0) * 1000.0
         _console_log(
-            "DONE object=%s elapsed_ms=%.1f selected_verts=%d selected_edges=%d "
+            "DONE object=%s elapsed_ms=%.1f read_ms=%.1f setup_ms=%.1f solve_ms=%.1f "
+            "write_ms=%.1f post_ms=%.1f selected_verts=%d selected_edges=%d "
             "selected_faces=%d islands=%d relaxed_islands=%d points=%d solves=%d "
             "cg_passes=%d steps=%d density=%.3f hold_border=%s" %
-            (context.active_object.name, ms, selection["verts"], selection["edges"],
-             selection["faces"], len(labs), relaxed, points, solves, took,
+            (context.active_object.name, ms, read_ms, setup_ms, solve_ms, write_ms, post_ms,
+             selection["verts"], selection["edges"], selection["faces"], len(labs), relaxed, points, solves, took,
              int(self.steps), float(self.density_weight), bool(self.pin_border)))
         self.report({"WARNING" if (declined or stuck or ran_out or within or across) else "INFO"},
                     "%d UV points on %d island(s) relaxed in %.0f ms | stretch median %.3f "
