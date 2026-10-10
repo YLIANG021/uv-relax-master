@@ -75,11 +75,6 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                     "0.1 the packing does not even out -- some faces keep sitting far off the island's "
                     "average density")
 
-    boundary_density: bpy.props.FloatProperty(
-        name="Boundary Density Weight", default=0.20, min=0.0, max=1.0,
-        description="Density Balance weight for faces touching the island boundary. Lower values "
-                    "protect the contour from sharp points")
-
     @classmethod
     def poll(cls, context):
         # Mesh.type reports None while the object is in edit mode, so look for UV layers
@@ -158,10 +153,6 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             uk, cnt = np.unique(edge, axis=0, return_counts=True)
             rim = np.zeros(len(ids), bool)
             rim[uk[cnt == 1].ravel()] = True
-            boundary_faces = np.any(rim[tl], axis=1)
-            density_face_weight = np.where(boundary_faces,
-                                            self.boundary_density, 1.0)
-
             if local_mode:
                 # A point may move only when every face around it was selected.  That is what
                 # keeps the untouched part of the island, and any seam it shares, exactly where
@@ -205,7 +196,7 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             newuv, st = core.relax_solve(
                 pf, tl, pos[ids], ~free, maxit=self.steps,
                 density_weight=self.density_weight,
-                density_face_weight=density_face_weight)
+                boundary_weight=None)
             if st["pass"] == 0:
                 # an island whose every point is held by a face left out is a different
                 # answer from one that has settled, and saying the wrong one sends him

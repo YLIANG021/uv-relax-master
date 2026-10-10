@@ -191,11 +191,14 @@ def stretch_terms(p, tuv, e_side=None):
 # how far out the density term is asked to care about a single face: its error is the logarithm of
 # the face's density over the island's target, saturated at this factor in both directions
 DENSITY_CAP = 8.0
+BOUNDARY_LOG_CAP = 2.5
+BOUNDARY_WEIGHT_BASE = 0.12
+BOUNDARY_WEIGHT_DENSITY = 0.42
 
 
 def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 fold_rounds=6, density_refine=8, density_tol=0.3,
-                density_face_weight=None):
+                density_face_weight=None, boundary_weight=None):
     """Bring one island to the evenest shape its boundary allows -- by solving for it.
 
     The conformal part of the energy this relaxes is a quadratic form in the UV coordinates:
@@ -280,13 +283,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
     total_a3 = float(a3.sum())
     weight = a3 / total_a3 if total_a3 > 1e-30 else np.zeros_like(a3)
     density_weight = max(float(density_weight), 0.0)
-    if density_face_weight is None:
-        density_face_weight = np.ones(len(a3), dtype=float)
-    else:
-        density_face_weight = np.asarray(density_face_weight, dtype=float)
-        if density_face_weight.shape != a3.shape:
-            raise ValueError("density_face_weight must have one value per triangle")
-        density_face_weight = np.clip(density_face_weight, 0.0, 1.0)
+    # Boundary protection is now a separate soft geometric metric.  Keep the old argument in the
+    # signature so a reloaded operator from the previous version remains callable.
     # the density target is the island's own starting UV area per 3D area, so the term evens the
     # packing inside the island without asking the island to change size
     density_target = (0.5 * float(np.abs(q0[valid]).sum()) / total_a3) if total_a3 > 1e-30 else 0.0
@@ -306,6 +304,33 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
 
     prepped = face_metric_prep(p)
 
+    # Recover the outline from topology and measure it in 3D.  The target UV length uses the
+    # island's starting average density, so a bad starting outline can move freely without making
+    # the whole island change scale just to satisfy the boundary term.
+    all_edges = np.concatenate([tl[:, [0, 1]], tl[:, [1, 2]], tl[:, [2, 0]]], axis=0)
+    all_edges = np.sort(all_edges, axis=1)
+    all_model_edges = np.concatenate([p[:, [0, 1]], p[:, [1, 2]], p[:, [2, 0]]], axis=0)
+    edge_order = np.lexsort((all_edges[:, 1], all_edges[:, 0]))
+    sorted_edges = all_edges[edge_order]
+    sorted_model_edges = all_model_edges[edge_order]
+    unique_edges, first_edge, edge_count = np.unique(
+        sorted_edges, axis=0, return_index=True, return_counts=True)
+    boundary_edges = unique_edges[edge_count == 1]
+    boundary_model_edges = sorted_model_edges[first_edge[edge_count == 1]]
+    boundary_3d_length = np.linalg.norm(
+        boundary_model_edges[:, 1] - boundary_model_edges[:, 0], axis=1)
+    boundary_valid = boundary_3d_length > 1e-30
+    boundary_edges = boundary_edges[boundary_valid]
+    boundary_3d_length = boundary_3d_length[boundary_valid]
+    boundary_target = np.sqrt(max(density_target, 1e-30)) * boundary_3d_length
+    if boundary_weight is None:
+        # Normalized below, so this does not depend on the number of outline edges.  Density
+        # pressure raises the protection automatically; there is no user-facing B slider to tune.
+        boundary_weight = BOUNDARY_WEIGHT_BASE + BOUNDARY_WEIGHT_DENSITY * min(density_weight, 1.0)
+    boundary_weight = max(float(boundary_weight), 0.0)
+    boundary_weights = (np.full(len(boundary_edges), boundary_weight / len(boundary_edges))
+                        if len(boundary_edges) else np.zeros(0, dtype=float))
+
     def shape(u):
         """How uneven the island is, the way the overlay sees it: every face's stretch above 1.0
         counted by square up to the knee, then by plain amount, so one ruined face cannot outvote
@@ -323,6 +348,14 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         out = np.empty((V, 2))
         for k in (0, 1):
             out[:, k] = np.bincount(flat, weights=gs[:, :, k].ravel(), minlength=V)
+        return out
+
+    def scatter_edges(gs):
+        """Sum boundary-edge endpoint contributions (E,2,2) onto island points."""
+        out = np.zeros((V, 2))
+        if len(boundary_edges):
+            np.add.at(out, boundary_edges[:, 0], gs[:, 0])
+            np.add.at(out, boundary_edges[:, 1], gs[:, 1])
         return out
 
     def ask(e_side):
@@ -383,7 +416,31 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         L = L / np.exp(err)[:, None, None]
         return L, np.einsum("tcv,tcv->t", L, base[tl]) - err
 
-    def system(A, w, signs, base, dens):
+    def boundary_error(u):
+        """Robust log edge-length residual against the 3D metric target."""
+        if not len(boundary_edges):
+            return np.zeros(0, dtype=float)
+        d = u[boundary_edges[:, 1]] - u[boundary_edges[:, 0]]
+        length = np.linalg.norm(d, axis=1)
+        ratio = np.ones_like(length)
+        np.divide(length, boundary_target, out=ratio, where=boundary_target > 1e-30)
+        return np.log(np.clip(ratio, np.exp(-BOUNDARY_LOG_CAP), np.exp(BOUNDARY_LOG_CAP)))
+
+    def boundary_lin(base):
+        """Linearize log(|uv edge| / target) at the current UV state."""
+        if not len(boundary_edges):
+            return np.zeros((0, 2, 2)), np.zeros(0, dtype=float)
+        d = base[boundary_edges[:, 1]] - base[boundary_edges[:, 0]]
+        length2 = np.einsum("ei,ei->e", d, d)
+        length = np.sqrt(np.maximum(length2, 1e-30))
+        err = boundary_error(base)
+        L = np.zeros((len(boundary_edges), 2, 2), dtype=float)
+        # d(log |b-a|) = (b-a) . (db-da) / |b-a|^2
+        L[:, 0] = -d / length2[:, None]
+        L[:, 1] = d / length2[:, None]
+        return L, np.einsum("eij,eij->e", L, base[boundary_edges]) - err
+
+    def system(A, w, signs, base, dens, boundary_factor=1.0):
         """The quadratic that stands in for the objective at `base`: Hessian-times-vector, the
         Hessian's diagonal, the constant part of its gradient, and a function that scores any state
         by this same quadratic.  `dens` False leaves the density term out, which makes it the
@@ -392,23 +449,40 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         what a step promises, the true `energy` being what the step is judged on."""
         lin = None
         wd = None
+        blin = None
+        wb = None
+        boundary_diag = np.zeros((V, 2))
 
         def hvp(v):
             d = np.einsum("tkcv,tcv->tk", A, v[tl])
             gs = np.einsum("tkcv,tk->tcv", A, d) * (2.0 * w)[:, None, None]
             if lin is None:
-                return scatter(gs)
-            L, _ = lin
-            return scatter(gs + (2.0 * wd * np.einsum("tcv,tcv->t", L, v[tl]))[:, None, None] * L)
+                out = scatter(gs)
+            else:
+                L, _ = lin
+                out = scatter(gs + (2.0 * wd * np.einsum("tcv,tcv->t", L, v[tl]))[:, None, None] * L)
+            if blin is not None:
+                Lb, _ = blin
+                db = np.einsum("eij,eij->e", Lb, v[boundary_edges])
+                out = out + scatter_edges((2.0 * wb * db)[:, None, None] * Lb)
+            return out
 
         dg = 2.0 * w[:, None, None] * (A[:, 0] ** 2 + A[:, 1] ** 2)
         c0 = np.zeros((V, 2))
         if dens:
             L, r = density_lin(signs, base)
-            wd = density_weight * weight * density_face_weight
+            wd = density_weight * weight
             lin = (L, r)
             c0 = scatter((-2.0 * wd * r)[:, None, None] * L)
             dg = dg + (2.0 * wd)[:, None, None] * L * L
+
+        if len(boundary_edges):
+            Lb, rb = boundary_lin(base)
+            wb = boundary_weights * boundary_factor
+            blin = (Lb, rb)
+            c0 = c0 + scatter_edges((-2.0 * wb * rb)[:, None, None] * Lb)
+            dg_b = (2.0 * wb)[:, None, None] * Lb * Lb
+            boundary_diag = scatter_edges(dg_b)
 
         def value(u):
             d = np.einsum("tkcv,tcv->tk", A, u[tl])
@@ -416,9 +490,12 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             if lin is not None:
                 L, off = lin
                 e += float((wd * (np.einsum("tcv,tcv->t", L, u[tl]) - off) ** 2).sum())
+            if blin is not None:
+                Lb, off_b = blin
+                e += float((wb * (np.einsum("eij,eij->e", Lb, u[boundary_edges]) - off_b) ** 2).sum())
             return e
 
-        return hvp, scatter(dg), c0, value
+        return hvp, scatter(dg) + boundary_diag, c0, value
 
     def energy(A, w, signs, u, dens):
         """The objective itself rather than its local stand-in, so successive Gauss-Newton steps can
@@ -427,7 +504,9 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         e = float((w[:, None] * d * d).sum())
         if dens:
             err = density_error(signs, u)
-            e += density_weight * float((weight * density_face_weight * err * err).sum())
+            e += density_weight * float((weight * err * err).sum())
+        if len(boundary_edges):
+            e += float((boundary_weights * boundary_error(u) ** 2).sum())
         return e
 
     def inverted(u):

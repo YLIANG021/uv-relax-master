@@ -59,11 +59,6 @@ class UVRELAX_PT_preferences(bpy.types.AddonPreferences):
                     "is bought from the faces themselves, which start to look skewed, and under about "
                     "0.1 the packing does not even out -- some faces keep sitting far off the island's "
                     "average density")
-    boundary_density: bpy.props.FloatProperty(
-        name="Boundary Density Weight", default=0.20, min=0.0, max=1.0,
-        description="Density Balance weight for faces touching the island boundary. Lower values "
-                    "protect the contour from sharp points")
-
     def draw(self, context):
         col = self.layout.column(align=True)
         col.prop(self, "hold_border")
@@ -90,11 +85,9 @@ class UVRELAX_PT_panel(bpy.types.Panel):
         op.pin_border = prefs.hold_border
         op.steps = prefs.steps
         op.density_weight = prefs.density_weight
-        op.boundary_density = prefs.boundary_density
         row.prop(prefs, "hold_border", text="", icon='LOCKED')
         layout.prop(prefs, "steps", text="Steps", slider=True)
         layout.prop(prefs, "density_weight", text="Density Balance", slider=True)
-        layout.prop(prefs, "boundary_density", text="Boundary Protection", slider=True)
 
         box = layout.box()
         box.prop(prefs, "overlay_on", text="Density Overlay", icon='IMAGE_RGB')
