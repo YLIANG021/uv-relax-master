@@ -522,6 +522,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
     # solve below projects its directions away from translation, rotation and scale instead, so every
     # island vertex remains free to move.
     gauge = None
+    scale_gauge = None
     if loose:
         cen = uv0.mean(0)
         q = uv0 - cen
@@ -531,6 +532,12 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             np.stack([-q[:, 1], q[:, 0]], axis=1),
             q,
         ], axis=2)
+    else:
+        # A partial solve has real Dirichlet points, so translation and rotation are already
+        # determined.  Its remaining failure mode is a uniform contraction of the free region
+        # towards the held part; remove only that one scale direction, leaving local shape changes
+        # unconstrained.
+        scale_gauge = (uv0 - uv0.mean(0))[:, :, None]
     # which points may move is worked out once, before any solve, and shared by both questions below:
     # a point no live triangle sits on has no stiffness and nothing to be even about
     _, stiff, _, _ = system(*ask(maj), uv0, False)
@@ -561,14 +568,18 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         """
         hvp, diag, c0, _ = system(A, w, signs, base, dens)
         live = (~held & ~clamp)[:, None]
-        use_gauge = gauge is not None and not clamp.any()
+        basis = None
+        if gauge is not None and not clamp.any():
+            basis = gauge
+        elif scale_gauge is not None:
+            basis = scale_gauge
 
         def project(v):
             v = v * live
-            if not use_gauge:
+            if basis is None:
                 return v
             active = live[:, 0]
-            M = gauge[active].reshape(-1, 4)
+            M = basis[active].reshape(-1, basis.shape[2])
             flat = v[active].reshape(-1)
             if len(flat) == 0:
                 return v

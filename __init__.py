@@ -3,17 +3,22 @@ if "bpy" in locals():
     importlib.reload(core)  # noqa: F821
     importlib.reload(bridge)  # noqa: F821
     importlib.reload(relax)  # noqa: F821
-    importlib.reload(overlay)  # noqa: F821
+    from .display import overlay as _display_overlay
+    importlib.reload(_display_overlay)
 
 import bpy
 
-from . import core, bridge, relax, overlay
+from . import core, bridge, relax
+from .display import overlay
 
 
 def _redraw_prop(self, _context):
     # every pref that updates through here only decides how the triangles are painted, so the
     # geometry that is already read stays good
-    overlay.invalidate_colors()
+    if self.overlay_on:
+        overlay.invalidate_colors()
+    else:
+        overlay.drop()
 
 
 class UVRELAX_PT_preferences(bpy.types.AddonPreferences):
@@ -30,6 +35,10 @@ class UVRELAX_PT_preferences(bpy.types.AddonPreferences):
         update=_redraw_prop)
     alpha: bpy.props.FloatProperty(
         name="Opacity", default=0.55, min=0.05, max=1.0, update=_redraw_prop)
+    brightness: bpy.props.FloatProperty(
+        name="Brightness", default=1.0, min=0.0, max=2.0, soft_max=1.5,
+        description="Multiply overlay colours without changing their opacity",
+        update=_redraw_prop)
     fade_grey: bpy.props.BoolProperty(
         name="Fade Matched Faces", default=False, description="Leave faces whose density "
         "already matches unpainted, so the texture shows through", update=_redraw_prop)
@@ -67,6 +76,7 @@ class UVRELAX_PT_preferences(bpy.types.AddonPreferences):
         col.prop(self, "overlay_on")
         col.prop(self, "span", slider=True)
         col.prop(self, "alpha", slider=True)
+        col.prop(self, "brightness", slider=True)
         col.prop(self, "fade_grey")
 
 
@@ -95,6 +105,7 @@ class UVRELAX_PT_panel(bpy.types.Panel):
         sub.active = prefs.overlay_on
         sub.prop(prefs, "span", text="Range", slider=True)
         sub.prop(prefs, "alpha", text="Opacity", slider=True)
+        sub.prop(prefs, "brightness", text="Brightness", slider=True)
         sub.prop(prefs, "fade_grey")
         if prefs.overlay_on:
             row = box.row(align=True)
@@ -115,10 +126,16 @@ def register():
         bpy.utils.register_class(cls)
     _handle = bpy.types.SpaceImageEditor.draw_handler_add(
         overlay.draw, (), 'WINDOW', 'POST_VIEW')
-    if overlay.on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.append(overlay.on_depsgraph_update)
-    if overlay.on_load_post not in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.append(overlay.on_load_post)
+    # Reloading an extension creates new function objects.  Remove an older copy first so a
+    # hot reload cannot leave two debounce handlers and two independent caches behind.
+    for name, handler in (("depsgraph_update_post", overlay.on_depsgraph_update),
+                          ("load_post", overlay.on_load_post)):
+        handlers = getattr(bpy.app.handlers, name)
+        for old in list(handlers):
+            if (getattr(old, "__module__", None) == handler.__module__
+                    and getattr(old, "__name__", None) == handler.__name__):
+                handlers.remove(old)
+        handlers.append(handler)
 
 
 def unregister():
@@ -129,8 +146,10 @@ def unregister():
     for name, handler in (("depsgraph_update_post", overlay.on_depsgraph_update),
                           ("load_post", overlay.on_load_post)):
         lst = getattr(bpy.app.handlers, name)
-        if handler in lst:
-            lst.remove(handler)
+        for old in list(lst):
+            if (getattr(old, "__module__", None) == handler.__module__
+                    and getattr(old, "__name__", None) == handler.__name__):
+                lst.remove(old)
     # the draw handler is off by now, so there is no frame to ask for -- just let the cached
     # arrays go instead of leaving a mesh's worth of vertices behind
     overlay.drop()

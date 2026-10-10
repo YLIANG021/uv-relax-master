@@ -58,7 +58,15 @@ def selected_faces(bm, poly_of_tri, sync):
     """Faces the UV editor considers selected.  With select-sync on, that is the ordinary
     face selection; with it off, the UV selection is a separate flag."""
     if sync:
-        flag = (1 if f.select else 0 for f in bm.faces)
+        # In sync mode Blender stores the active component on the mesh elements.  A UV edge-only
+        # selection does not necessarily select either adjacent face, so include selected edges and
+        # vertices here instead of letting the operator mistake the selection for "nothing".
+        def mesh_face_selected(face):
+            return (face.select
+                    or any(edge.select for edge in face.edges)
+                    or any(vert.select for vert in face.verts))
+
+        flag = (1 if mesh_face_selected(f) else 0 for f in bm.faces)
     else:
         # UV vertex/edge selection is stored per loop in Blender 5.x.  Using
         # only f.uv_select loses partial island selections because that flag

@@ -1,13 +1,14 @@
-import time
-
 import numpy as np
 import bpy
 import bmesh
 import gpu
+import struct
 from bpy.app.handlers import persistent
 from gpu_extras.batch import batch_for_shader
 
-from . import core, bridge
+from .. import core, bridge
+
+_ADDON_PACKAGE = __package__.rpartition(".")[0]
 
 # Sampled from the reference bar the colours are meant to match: grey at the neutral mark,
 # deep red at the 0 end, deep blue at the 2 end.
@@ -16,17 +17,18 @@ TOO_LITTLE = (0.760, 0.024, 0.028)   # red:  this face has too little UV for its
 TOO_MUCH = (0.043, 0.357, 0.745)     # blue: this face has more UV than it needs
 
 MAX_TRIANGLES = 400000
-REBUILD_MIN_SECONDS = 0.25
+DEBOUNCE_DELAY = 0.1
 
 _shader = None
-# the two halves of a rebuild, cached apart: _geom is every edited mesh's triangle corners and
-# the density each corner is to be painted with, _batch is that geometry painted.  Reading the
-# edit mesh is what costs; painting it is nearly free, so a colour pref must not invalidate _geom.
+# The UVO-style cache has two layers: per-object geometry/density data, and the single GPU batch
+# painted from it.  A colour preference only rebuilds the latter.
+_obj_cache = {}
 _geom = None
 _batch = None
 _col_key = None
-_last_build = 0.0
 _dirty = True
+_edit_keys = ()
+_debounce_fn = None
 
 
 def get_shader():
@@ -71,7 +73,7 @@ def log_ratio(co, tri, lt, uvs):
     return tuv, per_point[inv]
 
 
-def colors(lg, span, alpha, fade_grey):
+def colors(lg, span, alpha, fade_grey, brightness):
     """The reference bar's mapping: the density ratio itself read on a linear scale, grey at
     1.0, full red at 1-span (0 with the default span) and full blue at 1+span (2), clamped
     past both ends.  lg still arrives as log2 of the ratio because that is what comes out of
@@ -81,55 +83,85 @@ def colors(lg, span, alpha, fade_grey):
     target = np.where(t[:, None] < 0.0, np.array(TOO_LITTLE), np.array(TOO_MUCH))
     out = np.empty((len(t), 4), np.float32)
     out[:, :3] = m[:, None] * target + (1.0 - m[:, None]) * np.array(GRAY)
+    out[:, :3] = np.clip(out[:, :3] * brightness, 0.0, 1.0)
     out[:, 3] = alpha
     if fade_grey:
         out[:, 3] = alpha * np.minimum(m * 8.0, 1.0)
     return out
 
 
-def modal_running():
-    """True while any modal operator owns the mouse (a UV drag, G, R, a box select...)."""
-    wm = getattr(bpy.context, "window_manager", None)
-    if wm is None:
-        return False
-    for window in wm.windows:
-        if window.modal_operators:
-            return True
-    return False
+def _uv_hash(bm, uv_layer):
+    """Order-sensitive UV hash copied from UVO's edit-mesh cache strategy."""
+    h = 0
+    pack = struct.pack
+    for face in bm.faces:
+        for loop in face.loops:
+            uv = loop[uv_layer].uv
+            h = (h * 1000003 ^ hash(pack("2f", uv.x, uv.y))) & 0xFFFFFFFFFFFFFFFF
+    return h
 
 
-def edited_objects():
-    """The meshes the UV editor is currently showing.  A draw handler has a thinner context
-    than an operator, so fall back to object selection if the edit-mode collection is not
-    there."""
-    ctx = bpy.context
+def edited_objects(scene=None):
+    """Return the edit meshes from a scene, independent of the current draw context."""
+    scene = scene or getattr(bpy.context, "scene", None)
+    if scene is None:
+        return []
+    return [ob for ob in scene.objects
+            if ob.type == 'MESH' and ob.mode == 'EDIT'
+            and getattr(ob.data, "uv_layers", None) is not None]
+
+
+def _edit_key(objects):
+    return tuple(sorted((ob.name, ob.data.as_pointer()) for ob in objects))
+
+
+def _build_object_geometry(ob):
+    """Read one live edit mesh, using a copied BMesh like UVO to keep the snapshot stable."""
+    bm_copy = None
     try:
-        return list(ctx.objects_in_mode_unique_data)
-    except Exception:
-        return [ob for ob in ctx.selected_objects if ob.mode == 'EDIT']
+        bm_live = bmesh.from_edit_mesh(ob.data)
+        bm_copy = bm_live.copy()
+        bm_copy.faces.ensure_lookup_table()
+        uv_layer = bm_copy.loops.layers.uv.verify()
+        if uv_layer is None or not bm_copy.faces:
+            return None, None
+        current_hash = _uv_hash(bm_copy, uv_layer)
+        cached = _obj_cache.get(ob.name)
+        if cached and cached["hash"] == current_hash:
+            return current_hash, cached["geom"]
 
-
-def read_geometry():
-    """The expensive half: every edited mesh's triangle corners in UV space, plus the density
-    ratio each corner is to be painted with.  None of it depends on the colour prefs, so this
-    is the only part that has to be thrown away when the mesh moves."""
-    out = []
-    for ob in edited_objects():
-        if ob.mode != 'EDIT' or getattr(ob.data, "uv_layers", None) is None:
-            continue
-        got = bridge.read(bmesh.from_edit_mesh(ob.data))
+        got = bridge.read(bm_copy)
         if got is None:
-            continue
+            return current_hash, None
         co, tri, lt, uvs, _loops, _uvl, _poly = got
         if len(tri) > MAX_TRIANGLES:
-            continue
+            return current_hash, None
         tuv, lg = log_ratio(co, tri, lt, uvs)
-        # float32 is what the vertex buffer holds anyway, so filling it here rather than
-        # letting attr_fill convert costs nothing and halves the array that gets cached
         xyz = np.empty((len(tuv) * 3, 3), np.float32)
         xyz[:, :2] = tuv.reshape(-1, 2)
         xyz[:, 2] = 0.0
-        out.append((xyz, lg.reshape(-1)))
+        return current_hash, (xyz, lg.reshape(-1))
+    finally:
+        if bm_copy is not None:
+            bm_copy.free()
+
+
+def read_geometry(objects=None):
+    """Refresh changed objects and concatenate their cached geometry for painting."""
+    objects = edited_objects() if objects is None else objects
+    active_names = set()
+    for ob in objects:
+        active_names.add(ob.name)
+        current_hash, geom = _build_object_geometry(ob)
+        if current_hash is not None:
+            _obj_cache[ob.name] = {"hash": current_hash, "geom": geom}
+
+    for name in list(_obj_cache):
+        if name not in active_names:
+            del _obj_cache[name]
+
+    out = [entry["geom"] for name, entry in _obj_cache.items()
+           if entry.get("geom") is not None]
     return out or None
 
 
@@ -141,29 +173,22 @@ def paint(geom, prefs):
     290k vertices."""
     return batch_for_shader(get_shader(), "TRIS", {
         "pos": np.concatenate([g[0] for g in geom]),
-        "color": np.concatenate([colors(g[1], prefs.span, prefs.alpha, prefs.fade_grey)
+        "color": np.concatenate([colors(g[1], prefs.span, prefs.alpha, prefs.fade_grey,
+                                         prefs.brightness)
                                  for g in geom])})
 
 
 def rebuild(prefs):
     """One batch holding every edited mesh, rebuilt only when something changed."""
-    global _geom, _batch, _col_key, _last_build, _dirty
-    key = (round(prefs.span, 3), round(prefs.alpha, 3), prefs.fade_grey)
+    global _geom, _batch, _col_key, _dirty
+    key = (round(prefs.span, 3), round(prefs.alpha, 3), prefs.fade_grey,
+           round(prefs.brightness, 3))
     if _batch is not None and not _dirty and key == _col_key:
         return _batch
 
-    # Only a stale mesh is worth the freeze and the rate limit; repainting from geometry that
-    # is already read is cheap enough to do on every frame the slider asks for, and throttling
-    # it would leave the overlay wearing the colours of wherever the slider last got let go.
+    # The depsgraph handler debounces the event burst; the actual GPU rebuild happens on the next
+    # UV draw.  Idle frames only reuse the existing batch.
     if _dirty:
-        # Freezing during a drag is what keeps the painted layer from lagging behind the shells
-        # and appearing to shove other, overlapping islands around while you move one point.
-        if modal_running():
-            return _batch
-        now = time.perf_counter()
-        if now - _last_build < REBUILD_MIN_SECONDS:
-            return _batch
-        _last_build = now
         _geom = read_geometry()
         _dirty = False
         _batch = None
@@ -175,10 +200,22 @@ def rebuild(prefs):
 
 
 def draw():
+    global _edit_keys
     ctx = bpy.context
-    if getattr(getattr(ctx, "area", None), "ui_type", None) != "UV":
+    # The draw handler is owned by SpaceImageEditor.  Its ui_type changes between UV and
+    # image display states in Blender 5.x, so checking for the literal "UV" can suppress the
+    # handler even while the UV editor is visible.
+    area = getattr(ctx, "area", None)
+    if area is not None and getattr(area, "type", None) != "IMAGE_EDITOR":
         return
-    addon = ctx.preferences.addons.get(__package__)
+    objects = edited_objects(getattr(ctx, "scene", None))
+    current_keys = _edit_key(objects)
+    if current_keys != _edit_keys:
+        drop()
+        _edit_keys = current_keys
+    if not objects:
+        return
+    addon = ctx.preferences.addons.get(_ADDON_PACKAGE)
     if addon is None:
         return
     prefs = addon.preferences
@@ -202,8 +239,38 @@ def tag_uv_redraw():
         return
     for window in wm.windows:
         for area in window.screen.areas:
+            # The image editor's ui_type is not stable across UV/image display states.  Tag every
+            # image editor so enabling the overlay always schedules the draw handler.
             if area.type == 'IMAGE_EDITOR':
                 area.tag_redraw()
+
+
+def _cancel_debounce():
+    global _debounce_fn
+    if _debounce_fn is not None:
+        try:
+            bpy.app.timers.unregister(_debounce_fn)
+        except Exception:
+            pass
+        _debounce_fn = None
+
+
+def _schedule_debounce():
+    """Merge the burst of depsgraph events generated by a modal UV transform."""
+    global _debounce_fn
+    _cancel_debounce()
+
+    def _fire():
+        global _debounce_fn, _dirty
+        _debounce_fn = None
+        addon = bpy.context.preferences.addons.get(_ADDON_PACKAGE)
+        if addon is not None and addon.preferences.overlay_on:
+            _dirty = True
+        tag_uv_redraw()
+        return None
+
+    _debounce_fn = _fire
+    bpy.app.timers.register(_fire, first_interval=DEBOUNCE_DELAY)
 
 
 def invalidate():
@@ -228,24 +295,41 @@ def drop():
     """Forget every cached array, and mark the geometry stale so the next draw reads it back.
     Clearing the caches without that would leave rebuild() with nothing to paint and no reason
     to go and get it, which is a blank overlay that never comes back."""
-    global _geom, _batch, _col_key, _dirty
+    global _geom, _batch, _col_key, _dirty, _edit_keys
+    _cancel_debounce()
+    _obj_cache.clear()
     _geom = None
     _batch = None
     _col_key = None
     _dirty = True
+    _edit_keys = ()
 
 
 @persistent
-def on_depsgraph_update(_scene, depsgraph):
-    """Any edited mesh counts as a reason to re-read the UVs."""
+def on_depsgraph_update(scene, depsgraph):
+    """Invalidate current edit meshes and reset the cache across mode transitions."""
+    global _edit_keys
+    edited = edited_objects(scene)
+    current_keys = _edit_key(edited)
+    if current_keys != _edit_keys:
+        drop()
+        _edit_keys = current_keys
+        tag_uv_redraw()
+        return
+    if not edited:
+        return
     for update in depsgraph.updates:
         idt = update.id
+        # UV edits are reported as Mesh updates, but Blender does not guarantee that the
+        # geometry flag or the evaluated datablock pointer is set consistently for every UV
+        # transform.  UVO deliberately treats an edit-mode Mesh update as the invalidation
+        # signal and lets the 0.1 s debounce collapse the event burst.
         if isinstance(idt, bpy.types.Mesh):
-            invalidate()
+            _schedule_debounce()
             return
         if (isinstance(idt, bpy.types.Object) and idt.type == 'MESH'
                 and (update.is_updated_geometry or update.is_updated_transform)):
-            invalidate()
+            _schedule_debounce()
             return
 
 
