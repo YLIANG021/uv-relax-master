@@ -85,3 +85,43 @@ def selected_faces(bm, poly_of_tri, sync):
         sel = np.fromiter((1 if f.select else 0 for f in bm.faces),
                           np.int8, count=len(bm.faces)).astype(bool)
     return sel[poly_of_tri]
+
+
+def selection_counts(bm, sync):
+    """Count the components visible to the user in the current selection mode."""
+    if sync:
+        return {
+            "verts": sum(bool(v.select) for v in bm.verts),
+            "edges": sum(bool(e.select) for e in bm.edges),
+            "faces": sum(bool(f.select) for f in bm.faces),
+        }
+
+    uvl = bm.loops.layers.uv.active
+    verts = set()
+    edges = set()
+    faces = 0
+    for face in bm.faces:
+        loops = face.loops[:]
+        face_selected = bool(getattr(face, "uv_select", False))
+        for i, loop in enumerate(loops):
+            if getattr(loop, "uv_select_vert", False):
+                if uvl is None:
+                    verts.add(loop.vert.index)
+                else:
+                    uv = loop[uvl].uv
+                    verts.add((loop.vert.index, round(float(uv.x), 6), round(float(uv.y), 6)))
+            if getattr(loop, "uv_select_edge", False):
+                nxt = loops[(i + 1) % len(loops)]
+                if uvl is None:
+                    a = (loop.vert.index,)
+                    b = (nxt.vert.index,)
+                else:
+                    ua = loop[uvl].uv
+                    ub = nxt[uvl].uv
+                    a = (loop.vert.index, round(float(ua.x), 6), round(float(ua.y), 6))
+                    b = (nxt.vert.index, round(float(ub.x), 6), round(float(ub.y), 6))
+                edges.add(tuple(sorted((a, b))))
+            face_selected = (face_selected or getattr(loop, "uv_select_vert", False)
+                             or getattr(loop, "uv_select_edge", False))
+        faces += int(face_selected)
+    return {"verts": len(verts), "edges": len(edges), "faces": faces}

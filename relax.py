@@ -41,6 +41,13 @@ def _density_stats(density, area3d):
     p99 = _weighted_quantile(values, weights, 0.99)
     median = max(median, 1e-30)
     return float(cv), p90 / median, p99 / median
+
+
+def _console_log(message):
+    """Keep timing output visible in Blender's system console without changing operator UI."""
+    print("[UV Relax] " + message, flush=True)
+
+
 class UVRELAX_OT_relax(bpy.types.Operator):
     """Relax the selected part of a UV island.  Everything you did not select keeps its UV
     coordinates exactly, so seams stay matched.  With Hold Border off, the islands you touched relax
@@ -89,6 +96,8 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         bm = bmesh.from_edit_mesh(me)
         got = bridge.read(bm)
         if got is None:
+            _console_log("CANCEL reason=no_uv_map elapsed_ms=%.1f" %
+                         ((time.perf_counter() - t0) * 1000.0))
             self.report({"ERROR"}, "This object has no UV map")
             return {"CANCELLED"}
         co, tri, lt, uvs, loops, uvl, poly_of_tri = got
@@ -98,11 +107,18 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         U = int(inv.max()) + 1
         isl = core.islands(inv, U)[inv[:, 0]]
 
-        sel = bridge.selected_faces(bm, poly_of_tri,
-                                    context.tool_settings.use_uv_select_sync)
+        sync = bool(context.tool_settings.use_uv_select_sync)
+        selection = bridge.selection_counts(bm, sync)
+        sel = bridge.selected_faces(bm, poly_of_tri, sync)
         selection_present = bool(sel.any())
         if self.pin_border or selection_present:
             if not sel.any():
+                _console_log(
+                    "CANCEL object=%s mode=%s selected_verts=%d selected_edges=%d "
+                    "selected_faces=%d reason=empty_selection elapsed_ms=%.1f" %
+                    (context.active_object.name, "SYNC" if sync else "UV",
+                     selection["verts"], selection["edges"], selection["faces"],
+                     (time.perf_counter() - t0) * 1000.0))
                 self.report({"WARNING"}, "Nothing selected in the UV editor")
                 return {"CANCELLED"}
             labs = np.unique(isl[sel])
@@ -114,6 +130,14 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             # coordinates, and with nothing picked that is every island on the mesh.
             labs = np.unique(isl[sel]) if sel.any() else np.unique(isl)
             scope = np.isin(isl, labs)
+
+        _console_log(
+            "START object=%s mode=%s selected_verts=%d selected_edges=%d selected_faces=%d "
+            "scope_faces=%d islands=%d steps=%d density=%.3f hold_border=%s" %
+            (context.active_object.name, "SYNC" if sync else "UV",
+             selection["verts"], selection["edges"], selection["faces"],
+             int(scope.sum()), len(labs), int(self.steps), float(self.density_weight),
+             bool(self.pin_border)))
 
         pos = np.zeros((U, 2))
         pos[inv.ravel()] = tuv.reshape(-1, 2)
@@ -250,6 +274,11 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             # nowhere on screen and the button then simply looks dead
             self.report({"WARNING" if (stuck or declined) else "INFO"},
                         "Nothing relaxed: " + ", ".join(why))
+            _console_log(
+                "CANCEL object=%s reason=nothing_relaxed elapsed_ms=%.1f islands=%d "
+                "solves=%d cg_passes=%d" %
+                (context.active_object.name, (time.perf_counter() - t0) * 1000.0,
+                 len(labs), solves, took))
             return {"CANCELLED"}
 
         new_loop_uv = np.empty_like(uvs)
@@ -257,7 +286,6 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         bridge.write(loops, uvl, new_loop_uv)
         bmesh.update_edit_mesh(me)
 
-        ms = (time.perf_counter() - t0) * 1000.0
         p, a3 = core.uv3d(co, tri)
         shape0, k0 = core.face_metric(p, tuv)
         shape1, k1 = core.face_metric(p, new_loop_uv[lt])
@@ -296,6 +324,14 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             tail += " | %d face pair(s) now lie on top of a neighbouring island, because a border " \
                     "that was allowed to move took the room -- repack, or turn Hold Border on" \
                     % across
+        ms = (time.perf_counter() - t0) * 1000.0
+        _console_log(
+            "DONE object=%s elapsed_ms=%.1f selected_verts=%d selected_edges=%d "
+            "selected_faces=%d islands=%d relaxed_islands=%d points=%d solves=%d "
+            "cg_passes=%d steps=%d density=%.3f hold_border=%s" %
+            (context.active_object.name, ms, selection["verts"], selection["edges"],
+             selection["faces"], len(labs), relaxed, points, solves, took,
+             int(self.steps), float(self.density_weight), bool(self.pin_border)))
         self.report({"WARNING" if (declined or stuck or ran_out or within or across) else "INFO"},
                     "%d UV points on %d island(s) relaxed in %.0f ms | stretch median %.3f "
                     "-> %.3f, worst 1%% %.2f -> %.2f | density CV %.3f -> %.3f, "
