@@ -232,11 +232,10 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
     displacement is held at zero; which outline points belong in that set is the caller's business,
     and this module does not look at borders at all.  Held rather than softly pulled is what makes
     seam alignment a promise instead of a trend: a point no selected face pulls hardly moves, a
-    pinned one does not move.  A wholly loose island has its two furthest-apart points held
-    where they are, because this energy is the same for any similarity of the island and conjugate
-    gradients should not be asked to pick one out of a four dimensional kernel; the packing it
-    started with is put back after every accepted density round, and once more at the end for the
-    rounds that carry no density term to hold it.
+    pinned one does not move.  A wholly loose island keeps the four global similarity modes out of
+    the Krylov directions, rather than holding any physical UV point; the packing it started with
+    is put back after every accepted density round, and once more at the end for the rounds that
+    carry no density term to hold it.
 
     Faces the wrong way round are not priced either.  A flip is not a place on the energy surface,
     it is a change of *which problem the island should be solved for*, so it is handled
@@ -518,19 +517,24 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         return int(inverted(u).sum())
 
     loose = not bool(pin.any())
-    # with nothing pinned the island has no position, size or angle either, and conjugate gradients
-    # should not be asked to choose one from a four dimensional kernel: hold the two points furthest
-    # apart where they are, which asks for the solution nearest the one being looked at
-    anchor = np.zeros(V, bool)
+    # A loose island has a four-dimensional similarity nullspace.  These are global gauge freedoms,
+    # not boundary conditions: fixing two real UV vertices turns them into visible corners.  The
+    # solve below projects its directions away from translation, rotation and scale instead, so every
+    # island vertex remains free to move.
+    gauge = None
     if loose:
         cen = uv0.mean(0)
-        a = int(np.argmax(((uv0 - cen) ** 2).sum(1)))
-        b = int(np.argmax(((uv0 - uv0[a]) ** 2).sum(1)))
-        anchor[a] = anchor[b] = True
+        q = uv0 - cen
+        gauge = np.stack([
+            np.broadcast_to(np.array([1.0, 0.0]), (V, 2)),
+            np.broadcast_to(np.array([0.0, 1.0]), (V, 2)),
+            np.stack([-q[:, 1], q[:, 0]], axis=1),
+            q,
+        ], axis=2)
     # which points may move is worked out once, before any solve, and shared by both questions below:
     # a point no live triangle sits on has no stiffness and nothing to be even about
     _, stiff, _, _ = system(*ask(maj), uv0, False)
-    held = pin | anchor | (stiff.min(1) <= 0.0)
+    held = pin | (stiff.min(1) <= 0.0)
 
     stats = {"free": int((~held).sum()), "pass": 0, "solve": 0, "gain": 0.0, "why": "relaxed",
              "fold": int(wrong.sum()), "ask": None, "converged": True, "fold_left": 0}
@@ -550,55 +554,76 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         return (v - cen) * np.sqrt(area2_0 / now) + cen
 
     def solve(A, w, signs, clamp, base, dens, tol=1e-6):
-        """One global move: minimise the local quadratic over the points neither the selection, the
-        anchors nor `clamp` hold.  Returns (state, iterations, ran_out_of_iterations, displacement)."""
+        """One global move over every point not held by selection or a fold clamp.
+
+        On a loose island, each Krylov vector is projected off the four global similarity modes.
+        This fixes the numerical gauge without fixing any physical boundary vertex.
+        """
         hvp, diag, c0, _ = system(A, w, signs, base, dens)
         live = (~held & ~clamp)[:, None]
-        g = (hvp(base) + c0) * live
+        use_gauge = gauge is not None and not clamp.any()
+
+        def project(v):
+            v = v * live
+            if not use_gauge:
+                return v
+            active = live[:, 0]
+            M = gauge[active].reshape(-1, 4)
+            flat = v[active].reshape(-1)
+            if len(flat) == 0:
+                return v
+            # The four columns are independent for any non-degenerate island.  lstsq also handles
+            # a nearly collapsed selection without introducing a new hard vertex constraint.
+            coeff, _, _, _ = np.linalg.lstsq(M, flat, rcond=1e-12)
+            out = v.copy()
+            out[active] = (flat - M @ coeff).reshape(-1, 2)
+            return out
+
+        g = project(hvp(base) + c0)
         g0 = float(np.linalg.norm(g))
         inv_diag = live / np.maximum(diag, 1e-30)
-        r = -g
+        r = project(-g)
         # what the model says is left to win; when that is nothing the island is already standing
         # where this solve would put it, and there is no iteration worth spending
         if 0.5 * float((r * r * inv_diag).sum()) <= 1e-12 * max(energy(A, w, signs, base, dens),
                                                                 1e-30):
             return base.copy(), 0, False, np.zeros((V, 2))
         x = np.zeros((V, 2))
-        z = r * inv_diag
+        z = project(r * inv_diag)
         dirn = z.copy()
         rz = float((r * z).sum())
         cap = max(1, int(maxit))
         iters = 0
         out = True
         for iteration in range(1, cap + 1):
-            hp = hvp(dirn) * live
+            hp = project(hvp(dirn))
             ph = float((dirn * hp).sum())
             if ph <= 1e-30 or rz <= 1e-30:
                 out = False
                 break
             step = rz / ph
-            x = x + step * dirn
-            r = r - step * hp
+            x = project(x + step * dirn)
+            r = project(r - step * hp)
             iters = iteration
             # the recycled residual drifts away from the true one once the Krylov space has grown
             # long, and a drift nobody catches says "converged" about a state that is still moving
             rn = float(np.linalg.norm(r))
             check = rn
             if iteration % 20 == 0 or rn <= tol * g0:
-                rt = -(hvp(base + x) + c0) * live
+                rt = project(-(hvp(base + x) + c0))
                 check = float(np.linalg.norm(rt))
                 if abs(check - rn) > 0.5 * check:
                     r = rt
-                    z = r * inv_diag
+                    z = project(r * inv_diag)
                     dirn = z.copy()
                     rz = float((r * z).sum())
                     continue
             if check <= tol * g0:
                 out = False
                 break
-            z = r * inv_diag
+            z = project(r * inv_diag)
             rz_new = float((r * z).sum())
-            dirn = z + (rz_new / rz) * dirn
+            dirn = project(z + (rz_new / rz) * dirn)
             rz = rz_new
         return base + x, iters, out, x
 
