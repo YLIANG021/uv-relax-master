@@ -127,7 +127,7 @@ def register():
     _handle = bpy.types.SpaceImageEditor.draw_handler_add(
         overlay.draw, (), 'WINDOW', 'POST_VIEW')
     # Reloading an extension creates new function objects.  Remove an older copy first so a
-    # hot reload cannot leave two debounce handlers and two independent caches behind.
+    # hot reload cannot leave two refresh handlers and two independent caches behind.
     for name, handler in (("depsgraph_update_post", overlay.on_depsgraph_update),
                           ("load_post", overlay.on_load_post)):
         handlers = getattr(bpy.app.handlers, name)
