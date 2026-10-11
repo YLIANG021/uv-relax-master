@@ -98,7 +98,6 @@ class UVRELAX_PT_panel(bpy.types.Panel):
         row.prop(prefs, "hold_border", text="", icon='LOCKED')
         layout.prop(prefs, "steps", text="Steps", slider=True)
         layout.prop(prefs, "density_weight", text="Density Balance", slider=True)
-
         box = layout.box()
         box.prop(prefs, "overlay_on", text="Density Overlay", icon='IMAGE_RGB')
         sub = box.column(align=True)

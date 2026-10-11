@@ -54,9 +54,49 @@ def write(loops, uvl, uv_per_loop):
         crn[uvl].uv = uv
 
 
-def selected_faces(bm, poly_of_tri, sync):
-    """Faces the UV editor considers selected.  With select-sync on, that is the ordinary
-    face selection; with it off, the UV selection is a separate flag."""
+def _sync_mode(tool_settings):
+    """Return the mesh selection mode used by Sync Selection."""
+    modes = tuple(getattr(tool_settings, "mesh_select_mode", (False, False, True)))
+    if len(modes) >= 3:
+        if modes[0]:
+            return "VERT"
+        if modes[1]:
+            return "EDGE"
+    return "FACE"
+
+
+def selected_faces(bm, poly_of_tri, sync, tool_settings=None):
+    """Faces represented by the current UV selection.
+
+    Blender 5.x can retain a per-corner UV selection while Sync Selection is on.  That
+    state is essential for distinguishing two UV copies that share a mesh vertex or edge.
+    It is only valid after a selection operation that preserves it, so mesh selection is
+    retained as the documented fallback when the state is unavailable or empty.
+    """
+    sync_valid = bool(sync and getattr(bm, "uv_select_sync_valid", False))
+    if sync_valid and tool_settings is not None:
+        mode = _sync_mode(tool_settings)
+        if mode == "VERT":
+            def sync_face_selected(face):
+                return any(bool(getattr(loop, "uv_select_vert", False))
+                           for loop in face.loops)
+        elif mode == "EDGE":
+            def sync_face_selected(face):
+                return any(bool(getattr(loop, "uv_select_edge", False))
+                           for loop in face.loops)
+        else:
+            def sync_face_selected(face):
+                return bool(getattr(face, "uv_select", False))
+
+        uv_flag = np.fromiter(
+            (1 if sync_face_selected(face) else 0 for face in bm.faces),
+            np.int8, count=len(bm.faces)).astype(bool)
+        # A valid sync layer with no UV flags means the selection came from a mesh
+        # operation or the layer has not been populated yet.  Keep the mesh fallback
+        # rather than turning that into an unexpected no-op.
+        if uv_flag.any():
+            return uv_flag[poly_of_tri]
+
     if sync:
         # In sync mode Blender stores the active component on the mesh elements.  A UV edge-only
         # selection does not necessarily select either adjacent face, so include selected edges and

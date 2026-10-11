@@ -4,7 +4,6 @@ import bmesh
 import gpu
 import struct
 from bpy.app.handlers import persistent
-from gpu_extras.batch import batch_for_shader
 
 from .. import core, bridge
 
@@ -17,9 +16,9 @@ TOO_LITTLE = (0.760, 0.024, 0.028)   # red:  this face has too little UV for its
 TOO_MUCH = (0.043, 0.357, 0.745)     # blue: this face has more UV than it needs
 
 MAX_TRIANGLES = 400000
-# Maximum refresh rate while an edit transform is producing update events.  This is a throttle,
-# rather than a trailing debounce: a continuous drag still gets refreshes every 20 ms.
-REFRESH_INTERVAL = 0.02
+# Delay after the last edit event before rebuilding the overlay.  A continuous drag keeps
+# postponing the rebuild, so the expensive path runs once after the transform settles.
+REFRESH_INTERVAL = 0.1
 
 _shader = None
 # The UVO-style cache has two layers: per-object geometry/density data, and the single GPU batch
@@ -27,6 +26,10 @@ _shader = None
 _obj_cache = {}
 _geom = None
 _batch = None
+_vbo = None
+_vbo_count = 0
+_vbo_pos_id = None
+_vbo_color_id = None
 _col_key = None
 _dirty = True
 _edit_keys = ()
@@ -40,7 +43,7 @@ def get_shader():
     return _shader
 
 
-def log_ratio(co, tri, lt, uvs):
+def log_ratio(co, tri, lt, uvs, model=None):
     """UV corners of every triangle plus, per corner, log2 of that face's texel density
     divided by the average density of its own island.
 
@@ -53,8 +56,14 @@ def log_ratio(co, tri, lt, uvs):
     point between several faces gets one continuous value instead of flat triangles.  That
     is what makes the overlay read as a gradient rather than a checkerboard."""
     tuv = uvs[lt]
-    p, a3 = core.uv3d(co, tri)
-    _, det = core.face_metric(p, tuv)
+    if (model is None or model[0].shape != (len(tri), 3, 3)
+            or model[1].shape != (len(tri),)):
+        p, a3 = core.uv3d(co, tri)
+        metric_prep = core.face_metric_prep(p)
+        model = (p, a3, metric_prep)
+    else:
+        p, a3, metric_prep = model
+    _, det = core.face_metric_uv(metric_prep, tuv)
 
     e1 = tuv[:, 1] - tuv[:, 0]
     e2 = tuv[:, 2] - tuv[:, 0]
@@ -72,7 +81,7 @@ def log_ratio(co, tri, lt, uvs):
     num = np.bincount(corners, weights=np.repeat(per_face * auv, 3), minlength=U)
     den = np.bincount(corners, weights=np.repeat(auv, 3), minlength=U)
     per_point = np.where(den > 0.0, num / np.maximum(den, 1e-30), 0.0)
-    return tuv, per_point[inv]
+    return tuv, per_point[inv], model
 
 
 def colors(lg, span, alpha, fade_grey, brightness):
@@ -130,7 +139,7 @@ def _build_object_geometry(ob):
         current_hash = _uv_hash(bm_copy, uv_layer)
         cached = _obj_cache.get(ob.name)
         if cached and cached["hash"] == current_hash:
-            return current_hash, cached["geom"]
+            return current_hash, {"geom": cached["geom"], "model": cached.get("model")}
 
         got = bridge.read(bm_copy)
         if got is None:
@@ -138,11 +147,12 @@ def _build_object_geometry(ob):
         co, tri, lt, uvs, _loops, _uvl, _poly = got
         if len(tri) > MAX_TRIANGLES:
             return current_hash, None
-        tuv, lg = log_ratio(co, tri, lt, uvs)
+        cached_model = cached.get("model") if cached else None
+        tuv, lg, model = log_ratio(co, tri, lt, uvs, cached_model)
         xyz = np.empty((len(tuv) * 3, 3), np.float32)
         xyz[:, :2] = tuv.reshape(-1, 2)
         xyz[:, 2] = 0.0
-        return current_hash, (xyz, lg.reshape(-1))
+        return current_hash, {"geom": (xyz, lg.reshape(-1)), "model": model}
     finally:
         if bm_copy is not None:
             bm_copy.free()
@@ -156,7 +166,9 @@ def read_geometry(objects=None):
         active_names.add(ob.name)
         current_hash, geom = _build_object_geometry(ob)
         if current_hash is not None:
-            _obj_cache[ob.name] = {"hash": current_hash, "geom": geom}
+            _obj_cache[ob.name] = ({"hash": current_hash, **geom}
+                                   if geom is not None
+                                   else {"hash": current_hash, "geom": None, "model": None})
 
     for name in list(_obj_cache):
         if name not in active_names:
@@ -173,11 +185,22 @@ def paint(geom, prefs):
     The arrays go to batch_for_shader as they are -- attr_fill takes numpy, so turning them
     into Python lists first only buys a chance to be slow about it: 65 ms against 0.6 ms on
     290k vertices."""
-    return batch_for_shader(get_shader(), "TRIS", {
-        "pos": np.concatenate([g[0] for g in geom]),
-        "color": np.concatenate([colors(g[1], prefs.span, prefs.alpha, prefs.fade_grey,
+    global _batch, _vbo, _vbo_count, _vbo_pos_id, _vbo_color_id
+    positions = np.concatenate([g[0] for g in geom])
+    color_data = np.concatenate([colors(g[1], prefs.span, prefs.alpha, prefs.fade_grey,
                                          prefs.brightness)
-                                 for g in geom])})
+                                 for g in geom])
+    if _vbo is None or _batch is None or _vbo_count != len(positions):
+        from gpu.types import GPUBatch, GPUVertBuf, GPUVertFormat
+        fmt = GPUVertFormat()
+        _vbo_pos_id = fmt.attr_add(id="pos", comp_type="F32", len=3, fetch_mode="FLOAT")
+        _vbo_color_id = fmt.attr_add(id="color", comp_type="F32", len=4, fetch_mode="FLOAT")
+        _vbo = GPUVertBuf(format=fmt, len=len(positions))
+        _batch = GPUBatch(type="TRIS", buf=_vbo)
+        _vbo_count = len(positions)
+    _vbo.attr_fill(id=_vbo_pos_id, data=positions)
+    _vbo.attr_fill(id=_vbo_color_id, data=color_data)
+    return _batch
 
 
 def rebuild(prefs):
@@ -258,14 +281,13 @@ def _cancel_refresh():
 
 
 def _schedule_refresh():
-    """Throttle a burst of depsgraph events generated by a modal UV transform.
+    """Debounce depsgraph events generated by a modal UV transform.
 
-    The timer is active only after an edit event arrives.  Further events while it is pending are
-    coalesced instead of resetting the timer, so a continuous drag receives periodic refreshes.
+    Each new event replaces the pending timer, so a continuous drag postpones the expensive
+    overlay rebuild until the transform settles.
     """
     global _refresh_fn
-    if _refresh_fn is not None:
-        return
+    _cancel_refresh()
 
     def _fire():
         global _refresh_fn, _dirty
@@ -302,11 +324,16 @@ def drop():
     """Forget every cached array, and mark the geometry stale so the next draw reads it back.
     Clearing the caches without that would leave rebuild() with nothing to paint and no reason
     to go and get it, which is a blank overlay that never comes back."""
-    global _geom, _batch, _col_key, _dirty, _edit_keys
+    global _geom, _batch, _vbo, _vbo_count, _vbo_pos_id, _vbo_color_id
+    global _col_key, _dirty, _edit_keys
     _cancel_refresh()
     _obj_cache.clear()
     _geom = None
     _batch = None
+    _vbo = None
+    _vbo_count = 0
+    _vbo_pos_id = None
+    _vbo_color_id = None
     _col_key = None
     _dirty = True
     _edit_keys = ()

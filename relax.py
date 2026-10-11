@@ -106,8 +106,10 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         isl = core.islands(inv, U)[inv[:, 0]]
 
         sync = bool(context.tool_settings.use_uv_select_sync)
+        sync_uv_valid = bool(sync and getattr(bm, "uv_select_sync_valid", False))
+        selection_source = ("UV_CORNERS" if sync_uv_valid else "MESH") if sync else "UV"
         selection = bridge.selection_counts(bm, sync)
-        sel = bridge.selected_faces(bm, poly_of_tri, sync)
+        sel = bridge.selected_faces(bm, poly_of_tri, sync, context.tool_settings)
         selection_present = bool(sel.any())
         if self.pin_border or selection_present:
             if not sel.any():
@@ -119,8 +121,9 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                      (time.perf_counter() - t0) * 1000.0))
                 self.report({"WARNING"}, "Nothing selected in the UV editor")
                 return {"CANCELLED"}
-            labs = np.unique(isl[sel])
-            scope = sel.copy()
+            else:
+                labs = np.unique(isl[sel])
+                scope = sel.copy()
         else:
             # Nothing is held by the selection: each island you touched relaxes whole, and the only
             # thing held is that island's own outline, which the solve treats as boundary
@@ -131,10 +134,12 @@ class UVRELAX_OT_relax(bpy.types.Operator):
 
         _console_log(
             "START object=%s mode=%s selected_verts=%d selected_edges=%d selected_faces=%d "
-            "scope_faces=%d islands=%d steps=%d density=%.3f hold_border=%s" %
+            "scope_faces=%d islands=%d selection_source=%s steps=%d density=%.3f hold_border=%s" %
             (context.active_object.name, "SYNC" if sync else "UV",
              selection["verts"], selection["edges"], selection["faces"],
-             int(scope.sum()), len(labs), int(self.steps), float(self.density_weight),
+             int(scope.sum()), len(labs),
+             selection_source,
+             int(self.steps), float(self.density_weight),
              bool(self.pin_border)))
         setup_ms = (time.perf_counter() - t0) * 1000.0 - read_ms
 
@@ -401,12 +406,14 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             "selected_verts=%d selected_edges=%d "
             "selected_faces=%d islands=%d relaxed_islands=%d reduced_islands=%d "
             "reduced_faces=%d reduced_points=%d points=%d solves=%d "
-            "cg_passes=%d steps=%d density=%.3f hold_border=%s" %
+            "cg_passes=%d selection_source=%s steps=%d density=%.3f hold_border=%s" %
             (context.active_object.name, ms, read_ms, setup_ms, solve_ms, write_ms, post_ms,
              metric_ms, overlap_ms,
              selection["verts"], selection["edges"], selection["faces"], len(labs), relaxed,
              reduced_islands, reduced_faces, reduced_points, points, solves, took,
-             int(self.steps), float(self.density_weight), bool(self.pin_border)))
+             selection_source,
+             int(self.steps), float(self.density_weight),
+             bool(self.pin_border)))
         self.report({"WARNING" if (declined or stuck or ran_out or within or across) else "INFO"},
                     "%d UV points on %d island(s) relaxed in %.0f ms | stretch median %.3f "
                     "-> %.3f, worst 1%% %.2f -> %.2f | density CV %.3f -> %.3f, "
