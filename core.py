@@ -57,6 +57,23 @@ def uv3d(co, tri):
     return p, a3
 
 
+def boundary_geometry(p, tl):
+    """Return UV edge ids and their 3D lengths for the outline of a triangulated region."""
+    all_edges = np.concatenate([tl[:, [0, 1]], tl[:, [1, 2]], tl[:, [2, 0]]], axis=0)
+    all_edges = np.sort(all_edges, axis=1)
+    all_model_edges = np.concatenate([p[:, [0, 1]], p[:, [1, 2]], p[:, [2, 0]]], axis=0)
+    edge_order = np.lexsort((all_edges[:, 1], all_edges[:, 0]))
+    sorted_edges = all_edges[edge_order]
+    sorted_model_edges = all_model_edges[edge_order]
+    unique_edges, first_edge, edge_count = np.unique(
+        sorted_edges, axis=0, return_index=True, return_counts=True)
+    boundary_edges = unique_edges[edge_count == 1]
+    boundary_model_edges = sorted_model_edges[first_edge[edge_count == 1]]
+    lengths = np.linalg.norm(boundary_model_edges[:, 1] - boundary_model_edges[:, 0], axis=1)
+    valid = lengths > 1e-30
+    return boundary_edges[valid], lengths[valid]
+
+
 def uv_area(p, a3, tuv):
     """Summed UV area of faces given model corners, their 3D areas and UV corners."""
     return float((face_metric(p, tuv)[1] * a3).sum())
@@ -198,7 +215,12 @@ BOUNDARY_WEIGHT_DENSITY = 0.42
 
 def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 fold_rounds=6, density_refine=8, density_tol=0.3,
-                density_face_weight=None, boundary_weight=None):
+                density_face_weight=None, boundary_weight=None,
+                total_a3_override=None, density_target_override=None,
+                area2_override=None, spread_override=None,
+                majority_orientation=None, boundary_edges_override=None,
+                boundary_3d_length_override=None, boundary_count_override=None,
+                scale_center_override=None):
     """Bring one island to the evenest shape its boundary allows -- by solving for it.
 
     The conformal part of the energy this relaxes is a quadratic form in the UV coordinates:
@@ -271,7 +293,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
     V = len(uv0)
     q0 = signed_uv_area(uv0[tl])
     sg = np.sign(q0)
-    maj = 1.0 if (sg > 0).sum() >= (sg < 0).sum() else -1.0
+    maj = (1.0 if (sg > 0).sum() >= (sg < 0).sum() else -1.0
+           ) if majority_orientation is None else float(majority_orientation)
     wrong = (sg != maj) & (sg != 0.0)
     fold = bool(wrong.any())
 
@@ -279,16 +302,19 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
     e2 = p[:, 2] - p[:, 0]
     a3 = 0.5 * np.linalg.norm(np.cross(e1, e2), axis=1)
     valid = a3 > 1e-30
-    total_a3 = float(a3.sum())
+    total_a3 = float(a3.sum()) if total_a3_override is None else float(total_a3_override)
     weight = a3 / total_a3 if total_a3 > 1e-30 else np.zeros_like(a3)
     density_weight = max(float(density_weight), 0.0)
     # Boundary protection is now a separate soft geometric metric.  Keep the old argument in the
     # signature so a reloaded operator from the previous version remains callable.
     # the density target is the island's own starting UV area per 3D area, so the term evens the
     # packing inside the island without asking the island to change size
-    density_target = (0.5 * float(np.abs(q0[valid]).sum()) / total_a3) if total_a3 > 1e-30 else 0.0
+    density_target = ((0.5 * float(np.abs(q0[valid]).sum()) / total_a3)
+                      if total_a3 > 1e-30 else 0.0)
+    if density_target_override is not None:
+        density_target = float(density_target_override)
     use_d = density_weight > 0.0 and density_target > 1e-30
-    area2_0 = float(np.abs(q0).sum())
+    area2_0 = float(np.abs(q0).sum()) if area2_override is None else float(area2_override)
     # the density residual is a ratio of areas and has no units, while each conformal term is
     # 1/(8*model area) times coefficients that carry model length squared: the model scale cancels
     # (which is why scaling his mesh changes nothing) and what is left is (UV length)^2, so the sum
@@ -299,35 +325,29 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
     # collapsed to a point has no area to divide by and no stretch to minimise either, so there the
     # weights stay as they are.
     conf_norm = 1.0 / area2_0 if area2_0 > 1e-30 else 1.0
-    spread = float(np.linalg.norm(uv0.max(0) - uv0.min(0)) + 1e-30)
+    spread = (float(np.linalg.norm(uv0.max(0) - uv0.min(0)) + 1e-30)
+              if spread_override is None else float(spread_override))
 
     prepped = face_metric_prep(p)
 
     # Recover the outline from topology and measure it in 3D.  The target UV length uses the
     # island's starting average density, so a bad starting outline can move freely without making
     # the whole island change scale just to satisfy the boundary term.
-    all_edges = np.concatenate([tl[:, [0, 1]], tl[:, [1, 2]], tl[:, [2, 0]]], axis=0)
-    all_edges = np.sort(all_edges, axis=1)
-    all_model_edges = np.concatenate([p[:, [0, 1]], p[:, [1, 2]], p[:, [2, 0]]], axis=0)
-    edge_order = np.lexsort((all_edges[:, 1], all_edges[:, 0]))
-    sorted_edges = all_edges[edge_order]
-    sorted_model_edges = all_model_edges[edge_order]
-    unique_edges, first_edge, edge_count = np.unique(
-        sorted_edges, axis=0, return_index=True, return_counts=True)
-    boundary_edges = unique_edges[edge_count == 1]
-    boundary_model_edges = sorted_model_edges[first_edge[edge_count == 1]]
-    boundary_3d_length = np.linalg.norm(
-        boundary_model_edges[:, 1] - boundary_model_edges[:, 0], axis=1)
-    boundary_valid = boundary_3d_length > 1e-30
-    boundary_edges = boundary_edges[boundary_valid]
-    boundary_3d_length = boundary_3d_length[boundary_valid]
+    if boundary_edges_override is None:
+        boundary_edges, boundary_3d_length = boundary_geometry(p, tl)
+        boundary_count = len(boundary_edges)
+    else:
+        boundary_edges = np.asarray(boundary_edges_override, dtype=np.int64)
+        boundary_3d_length = np.asarray(boundary_3d_length_override, dtype=float)
+        boundary_count = (len(boundary_edges) if boundary_count_override is None
+                          else int(boundary_count_override))
     boundary_target = np.sqrt(max(density_target, 1e-30)) * boundary_3d_length
     if boundary_weight is None:
         # Normalized below, so this does not depend on the number of outline edges.  Density
         # pressure raises the protection automatically; there is no user-facing B slider to tune.
         boundary_weight = BOUNDARY_WEIGHT_BASE + BOUNDARY_WEIGHT_DENSITY * min(density_weight, 1.0)
     boundary_weight = max(float(boundary_weight), 0.0)
-    boundary_weights = (np.full(len(boundary_edges), boundary_weight / len(boundary_edges))
+    boundary_weights = (np.full(len(boundary_edges), boundary_weight / boundary_count)
                         if len(boundary_edges) else np.zeros(0, dtype=float))
 
     def shape(u):
@@ -561,7 +581,9 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         # determined.  Its remaining failure mode is a uniform contraction of the free region
         # towards the held part; remove only that one scale direction, leaving local shape changes
         # unconstrained.
-        scale_gauge = (uv0 - uv0.mean(0))[:, :, None]
+        scale_center = uv0.mean(0) if scale_center_override is None else np.asarray(
+            scale_center_override, dtype=float)
+        scale_gauge = (uv0 - scale_center)[:, :, None]
     # which points may move is worked out once, before any solve, and shared by both questions below:
     # a point no live triangle sits on has no stiffness and nothing to be even about
     _, stiff, _, _, _ = system(*ask(maj), uv0, False)

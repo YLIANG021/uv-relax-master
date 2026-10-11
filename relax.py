@@ -156,6 +156,9 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         ran_out = 0
         took = 0
         solves = 0
+        reduced_islands = 0
+        reduced_faces = 0
+        reduced_points = 0
         # which islands the loop actually wrote back: the overlap count is charged against these
         # faces only, so an island that was already stamped over a neighbour before the button was
         # pressed is not reported as this button's work
@@ -217,10 +220,62 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                 continue
 
             pf, a3 = core.uv3d(co, tri[f])
+            solve_p = pf
+            solve_tl = tl
+            solve_uv = pos[ids]
+            solve_pin = ~free
+            solve_kwargs = {}
+            reduced = False
+            if local_mode:
+                # Faces made entirely of held points contribute only a constant to the local
+                # objective.  Drop them, while retaining every face that touches a free point and
+                # the original island-wide reference values used by density and boundary terms.
+                active_face = np.any(free[tl], axis=1)
+                if active_face.any() and int(active_face.sum()) < len(f):
+                    local_ids = np.unique(tl[active_face])
+                    local_remap = -np.ones(len(ids), np.int64)
+                    local_remap[local_ids] = np.arange(len(local_ids))
+                    solve_tl = local_remap[tl[active_face]]
+                    solve_p = pf[active_face]
+                    solve_uv = pos[ids][local_ids]
+                    solve_pin = ~free[local_ids]
+
+                    q_full = core.signed_uv_area(pos[ids][tl])
+                    valid_full = a3 > 1e-30
+                    total_a3_full = float(a3.sum())
+                    density_target_full = (0.5 * float(np.abs(q_full[valid_full]).sum()) /
+                                           total_a3_full if total_a3_full > 1e-30 else 0.0)
+                    full_boundary_edges, full_boundary_lengths = core.boundary_geometry(pf, tl)
+                    if len(full_boundary_edges):
+                        keep_boundary = np.all(local_remap[full_boundary_edges] >= 0, axis=1)
+                        boundary_edges = local_remap[full_boundary_edges[keep_boundary]]
+                        boundary_lengths = full_boundary_lengths[keep_boundary]
+                    else:
+                        boundary_edges = np.zeros((0, 2), np.int64)
+                        boundary_lengths = np.zeros(0, dtype=float)
+                    signs_full = np.sign(q_full)
+                    majority_full = (1.0 if (signs_full > 0).sum() >= (signs_full < 0).sum()
+                                     else -1.0)
+                    solve_kwargs = {
+                        "total_a3_override": total_a3_full,
+                        "density_target_override": density_target_full,
+                        "area2_override": float(np.abs(q_full).sum()),
+                        "spread_override": float(np.linalg.norm(
+                            pos[ids].max(0) - pos[ids].min(0)) + 1e-30),
+                        "scale_center_override": pos[ids].mean(0),
+                        "majority_orientation": majority_full,
+                        "boundary_edges_override": boundary_edges,
+                        "boundary_3d_length_override": boundary_lengths,
+                        "boundary_count_override": len(full_boundary_edges),
+                    }
+                    reduced = True
+                    reduced_islands += 1
+                    reduced_faces += int(active_face.sum())
+                    reduced_points += len(local_ids)
             newuv, st = core.relax_solve(
-                pf, tl, pos[ids], ~free, maxit=self.steps,
+                solve_p, solve_tl, solve_uv, solve_pin, maxit=self.steps,
                 density_weight=self.density_weight,
-                boundary_weight=None)
+                boundary_weight=None, **solve_kwargs)
             if st["pass"] == 0:
                 # an island whose every point is held by a face left out is a different
                 # answer from one that has settled, and saying the wrong one sends him
@@ -248,7 +303,10 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                 # worth him knowing which of the two he is looking at
                 mirrored += 1
                 mirrored_faces += int(st["fold_left"])
-            pos[ids] = newuv
+            if reduced:
+                pos[ids[local_ids]] = newuv
+            else:
+                pos[ids] = newuv
             moved_labs.append(lab)
             points += int(free.sum())
             relaxed += 1
@@ -276,10 +334,11 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                         "Nothing relaxed: " + ", ".join(why))
             _console_log(
                 "CANCEL object=%s reason=nothing_relaxed elapsed_ms=%.1f read_ms=%.1f "
-                "setup_ms=%.1f solve_ms=%.1f islands=%d solves=%d cg_passes=%d" %
+            "setup_ms=%.1f solve_ms=%.1f islands=%d reduced_islands=%d "
+            "reduced_faces=%d reduced_points=%d solves=%d cg_passes=%d" %
                 (context.active_object.name, (time.perf_counter() - t0) * 1000.0,
                  read_ms, setup_ms, (time.perf_counter() - solve_t0) * 1000.0,
-                 len(labs), solves, took))
+                 len(labs), reduced_islands, reduced_faces, reduced_points, solves, took))
             return {"CANCELLED"}
 
         solve_ms = (time.perf_counter() - solve_t0) * 1000.0
@@ -340,11 +399,13 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             "DONE object=%s elapsed_ms=%.1f read_ms=%.1f setup_ms=%.1f solve_ms=%.1f "
             "write_ms=%.1f post_ms=%.1f metric_ms=%.1f overlap_ms=%.1f "
             "selected_verts=%d selected_edges=%d "
-            "selected_faces=%d islands=%d relaxed_islands=%d points=%d solves=%d "
+            "selected_faces=%d islands=%d relaxed_islands=%d reduced_islands=%d "
+            "reduced_faces=%d reduced_points=%d points=%d solves=%d "
             "cg_passes=%d steps=%d density=%.3f hold_border=%s" %
             (context.active_object.name, ms, read_ms, setup_ms, solve_ms, write_ms, post_ms,
              metric_ms, overlap_ms,
-             selection["verts"], selection["edges"], selection["faces"], len(labs), relaxed, points, solves, took,
+             selection["verts"], selection["edges"], selection["faces"], len(labs), relaxed,
+             reduced_islands, reduced_faces, reduced_points, points, solves, took,
              int(self.steps), float(self.density_weight), bool(self.pin_border)))
         self.report({"WARNING" if (declined or stuck or ran_out or within or across) else "INFO"},
                     "%d UV points on %d island(s) relaxed in %.0f ms | stretch median %.3f "
