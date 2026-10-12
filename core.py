@@ -1,6 +1,8 @@
 # numpy-only UV math.  No bpy types: every function runs on plain arrays, so the exact
 # same code is testable outside Blender.
 
+import time
+
 import numpy as np
 
 
@@ -291,6 +293,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
     stats["ask"] which of the two questions won: "open" asked for one orientation and worked to turn
     the folds back, "even" left them mirrored and evened them out instead."""
     V = len(uv0)
+    profile = {"model_ms": 0.0, "preconditioner_ms": 0.0, "cg_ms": 0.0,
+               "line_search_ms": 0.0}
     q0 = signed_uv_area(uv0[tl])
     sg = np.sign(q0)
     maj = (1.0 if (sg > 0).sum() >= (sg < 0).sum() else -1.0
@@ -480,6 +484,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         conformal energy exactly -- the problem the fold rounds want, because that one is convex and
         its bottom is the whole island's answer.  With the density term in, the scoring function is
         what a step promises, the true `energy` being what the step is judged on."""
+        model_t0 = time.perf_counter()
         lin = None
         wd = None
         blin = None
@@ -538,7 +543,9 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             return e
 
         block_diag = scatter_blocks(face_blocks) + scatter_edge_blocks(boundary_blocks)
-        return hvp, scatter(dg) + boundary_diag, c0, value, block_diag
+        diag = scatter(dg) + boundary_diag
+        profile["model_ms"] += (time.perf_counter() - model_t0) * 1000.0
+        return hvp, diag, c0, value, block_diag
 
     def energy(A, w, signs, u, dens):
         """The objective itself rather than its local stand-in, so successive Gauss-Newton steps can
@@ -590,9 +597,11 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
     held = pin | (stiff.min(1) <= 0.0)
 
     stats = {"free": int((~held).sum()), "pass": 0, "solve": 0, "gain": 0.0, "why": "relaxed",
-             "fold": int(wrong.sum()), "ask": None, "converged": True, "fold_left": 0}
+             "fold": int(wrong.sum()), "ask": None, "converged": True, "fold_left": 0,
+             **profile}
     if held.all():
         stats["why"] = "nothing to move"
+        stats.update(profile)
         return uv0.copy(), stats
     flip0 = inside_out(uv0)
 
@@ -616,6 +625,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             model = system(A, w, signs, base, dens)
         hvp, diag, c0, _, block_diag = model
         live = (~held & ~clamp)[:, None]
+        active = live[:, 0]
+        preconditioner_t0 = time.perf_counter()
         basis = None
         if gauge is not None and not clamp.any():
             basis = gauge
@@ -628,29 +639,23 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         # matrix-vector products per iteration.
         projector = None
         if basis is not None:
-            active = live[:, 0]
             M = basis[active].reshape(-1, basis.shape[2])
             if len(M):
                 Q, _ = np.linalg.qr(M, mode="reduced")
                 projector = Q
 
         def project(v):
-            v = v * live
             if projector is None:
-                return v
-            active = live[:, 0]
-            flat = v[active].reshape(-1)
-            if len(flat) == 0:
-                return v
+                return v * live
             out = v.copy()
-            out[active] = (flat - projector @ (projector.T @ flat)).reshape(-1, 2)
+            out[~active] = 0.0
+            flat = out[active].reshape(-1)
+            if len(flat):
+                out[active] = (flat - projector @ (projector.T @ flat)).reshape(-1, 2)
             return out
 
-        g = project(hvp(base) + c0)
-        g0 = float(np.linalg.norm(g))
         inv_diag = live / np.maximum(diag, 1e-30)
         block_inv = np.zeros_like(block_diag)
-        active = live[:, 0]
         if active.any():
             blocks = block_diag[active]
             scale = np.maximum(np.max(np.abs(blocks), axis=(1, 2)), 1e-30)
@@ -666,20 +671,27 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 inverse[:, 1, 0] = -selected[:, 1, 0] * inv_det
                 active_ids = np.flatnonzero(active)
                 block_inv[active_ids[good]] = inverse
+        fallback = active & (np.max(np.abs(block_inv), axis=(1, 2)) <= 0.0)
 
         def precondition(v):
             """Apply a per-UV-point 2x2 Jacobi block, with scalar fallback for flat points."""
             out = np.einsum("vij,vj->vi", block_inv, v)
-            fallback = active & (np.max(np.abs(block_inv), axis=(1, 2)) <= 0.0)
             if fallback.any():
                 out[fallback] = v[fallback] * inv_diag[fallback]
-            return out * live
+            out[~active] = 0.0
+            return out
 
+        profile["preconditioner_ms"] += (time.perf_counter() - preconditioner_t0) * 1000.0
+
+        cg_t0 = time.perf_counter()
+        g = project(hvp(base) + c0)
+        g0 = float(np.linalg.norm(g))
         r = project(-g)
         # what the model says is left to win; when that is nothing the island is already standing
         # where this solve would put it, and there is no iteration worth spending
         if 0.5 * float((r * precondition(r)).sum()) <= 1e-12 * max(
                 energy(A, w, signs, base, dens), 1e-30):
+            profile["cg_ms"] += (time.perf_counter() - cg_t0) * 1000.0
             return base.copy(), 0, False, np.zeros((V, 2))
         x = np.zeros((V, 2))
         z = project(precondition(r))
@@ -718,6 +730,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             rz_new = float((r * z).sum())
             dirn = project(z + (rz_new / rz) * dirn)
             rz = rz_new
+        profile["cg_ms"] += (time.perf_counter() - cg_t0) * 1000.0
         return base + x, iters, out, x
 
     def run(e_side, rounds, pin_folds):
@@ -781,6 +794,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 note(iters, hit)
                 if iters == 0:
                     break
+                line_search_t0 = time.perf_counter()
                 e_last = energy(A, w, signs, base, True)
                 # m(t) = e_last + a t + b t^2 along the ray, read off the model at t = 1/2 and t = 1
                 slope = 4.0 * (value(base + 0.5 * x) - e_last) - (value(cand) - e_last)
@@ -796,6 +810,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                         base = u
                         keep(base)
                         break
+                profile["line_search_ms"] += (time.perf_counter() - line_search_t0) * 1000.0
                 if moved is None or float(np.abs(moved).max()) <= 1e-7 * spread:
                     break
             return base
@@ -856,6 +871,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
     if win is None:
         stats["ask"] = "open"
         stats["why"] = "left alone" if fold else "already even"
+        stats.update(profile)
         return uv0.copy(), stats
     _, stats["ask"], at, stats["pass"], stats["solve"], out, stats["gain"] = win
     if loose:
@@ -864,10 +880,12 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         at = restore(at)
     stats["converged"] = not out
     stats["fold_left"] = inside_out(at)
+    stats.update(profile)
     return at, stats
 
 
-def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536):
+def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
+                      return_pairs=False):
     """How many pairs of these faces lie on top of each other in UV.
 
     The relaxed energy cannot see this: it asks each face to be a good similarity of itself and is
@@ -894,13 +912,15 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536):
     allowed to move -- given, only pairs with a moved face in them are counted, and they come back
     split two ways, because an island stamped over itself and an island that grew over a neighbour
     are different problems: the first is opened by a seam, the second by the packer.
-    Returns (pairs within one island, pairs across islands)."""
+    Returns (pairs within one island, pairs across islands); with `return_pairs`, also returns
+    the matching face-index pairs, with the within-island pairs first."""
     t = u[tl]
     area2 = signed_uv_area(t)
     biggest = float(np.abs(area2).max()) if len(area2) else 0.0
     f = np.flatnonzero(np.abs(area2) > 1e-12 * max(biggest, 1e-30))
     if f.size < 2:
-        return 0, 0
+        empty = np.zeros((0, 2), np.int64)
+        return (0, 0, empty) if return_pairs else (0, 0)
     t = t[f]
     n = len(t)
     lab = np.zeros(n, np.int64) if lab is None else np.asarray(lab)[f]
@@ -918,7 +938,8 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536):
     cnt = np.clip(ends - np.arange(n) - 1, 0, window)
     total = int(cnt.sum())
     if total == 0:
-        return 0, 0
+        empty = np.zeros((0, 2), np.int64)
+        return (0, 0, empty) if return_pairs else (0, 0)
     starts = np.cumsum(cnt) - cnt
     ii = np.repeat(np.arange(n), cnt)
     jj = ii + 1 + (np.arange(total) - np.repeat(starts, cnt))
@@ -936,6 +957,7 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536):
     def narrow(ii):
         """Separating-axis test over the listed pairs, in blocks."""
         hits = 0
+        pair_blocks = []
         for s in range(0, len(ii), block):
             pa, pb = a[ii[s:s + block]], b[ii[s:s + block]]
             ta, tb = t[pa], t[pb]
@@ -947,7 +969,139 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536):
             # itself is made of faces a hundred times smaller than the ones around it, and a
             # tolerance measured on those would let the stamp pass for clean
             slack = 0.05 * np.minimum(scale[pa], scale[pb])[:, None]
-            hits += int((gap > slack).all(1).sum())
-        return hits
+            hit = (gap > slack).all(1)
+            hits += int(hit.sum())
+            if return_pairs and hit.any():
+                pair_blocks.append(np.stack([f[pa[hit]], f[pb[hit]]], axis=1))
+        pairs = (np.concatenate(pair_blocks) if pair_blocks
+                 else np.zeros((0, 2), np.int64))
+        return hits, pairs
 
-    return narrow(np.flatnonzero(same)), 0 if mv is None else narrow(np.flatnonzero(~same))
+    same_count, same_pairs = narrow(np.flatnonzero(same))
+    if mv is None:
+        across_count, across_pairs = 0, np.zeros((0, 2), np.int64)
+    else:
+        across_count, across_pairs = narrow(np.flatnonzero(~same))
+    if return_pairs:
+        return same_count, across_count, np.concatenate([same_pairs, across_pairs])
+    return same_count, across_count
+
+
+def untangle_overlaps(tl, u, movable, lab=None, max_rounds=6,
+                     moved_faces=None, initial=None):
+    """Apply small, flip-safe separating-axis corrections to detected face overlaps.
+
+    Only vertices marked movable receive translation. A correction is retained only if the
+    overlap count or penetration drops and no previously valid face flips, so this is a local
+    cleanup stage, not a replacement for the main shape solve.
+    """
+    out = np.asarray(u, dtype=float).copy()
+    movable = np.asarray(movable, dtype=bool)
+    if moved_faces is None:
+        moved_faces = np.any(movable[tl], axis=1)
+    if initial is None:
+        within, across, pairs = overlapping_pairs(
+            tl, out, lab, moved_faces, return_pairs=True)
+    else:
+        within, across, pairs = initial
+    initial_count = within + across
+    if initial_count == 0:
+        return out, {"before": 0, "after": 0, "rounds": 0,
+                     "within": 0, "across": 0}
+    if not movable.any():
+        return out, {"before": initial_count, "after": initial_count, "rounds": 0,
+                     "within": within, "across": across}
+    start_area = signed_uv_area(out[tl])
+    rounds = 0
+    final_within, final_across = within, across
+
+    for _ in range(max(0, int(max_rounds))):
+        current = within + across
+        if current == 0 or len(pairs) == 0:
+            break
+
+        tri_uv = out[tl]
+        face_scale = np.sqrt(np.abs(signed_uv_area(tri_uv)))
+        pair_faces = np.unique(pairs)
+        max_step = max(float(np.median(face_scale[pair_faces])) * 0.2, 1e-8)
+        edge = np.stack([tri_uv[:, 1] - tri_uv[:, 0],
+                         tri_uv[:, 2] - tri_uv[:, 1],
+                         tri_uv[:, 0] - tri_uv[:, 2]], axis=1)
+        normals = np.stack([-edge[..., 1], edge[..., 0]], axis=-1)
+        fa, fb = pairs[:, 0], pairs[:, 1]
+        axes = np.concatenate([normals[fa], normals[fb]], axis=1)
+        norm = np.linalg.norm(axes, axis=2)
+        axes = axes / np.maximum(norm[..., None], 1e-30)
+        pa = np.einsum("pnc,pkc->pnk", tri_uv[fa], axes)
+        pb = np.einsum("pnc,pkc->pnk", tri_uv[fb], axes)
+        move_a = pa.max(1) - pb.min(1)
+        move_b = pb.max(1) - pa.min(1)
+        direction_a = move_a <= move_b
+        depth = np.minimum(move_a, move_b)
+        axis_id = np.argmin(np.minimum(move_a, move_b), axis=1)
+        pair_id = np.arange(len(pairs))
+        current_cost = float(depth[pair_id, axis_id].sum())
+        axis = axes[np.arange(len(pairs)), axis_id]
+        axis[~direction_a[pair_id, axis_id]] *= -1.0
+
+        delta = np.zeros_like(out)
+        weight = np.zeros(len(out))
+        for k, (a, b) in enumerate(pairs):
+            free_a = tl[a, movable[tl[a]]]
+            free_b = tl[b, movable[tl[b]]]
+            if not len(free_a) and not len(free_b):
+                continue
+            share_a = 1.0 if not len(free_b) else (0.5 if len(free_a) else 0.0)
+            share_b = 1.0 if not len(free_a) else (0.5 if len(free_b) else 0.0)
+            push = min(float(depth[k, axis_id[k]]) + max_step * 0.1, max_step)
+            if len(free_a):
+                np.add.at(delta, free_a, -axis[k] * (push * share_a))
+                np.add.at(weight, free_a, 1.0)
+            if len(free_b):
+                np.add.at(delta, free_b, axis[k] * (push * share_b))
+                np.add.at(weight, free_b, 1.0)
+        valid = weight > 0.0
+        if not valid.any():
+            break
+        delta[valid] /= weight[valid, None]
+        magnitude = np.linalg.norm(delta[valid], axis=1)
+        delta[valid] *= np.minimum(1.0, max_step / np.maximum(magnitude, 1e-30))[:, None]
+
+        accepted = False
+        for scale in (1.0, 0.5, 0.25, 0.125):
+            candidate = out.copy()
+            candidate[valid] += delta[valid] * scale
+            area = signed_uv_area(candidate[tl])
+            live_area = np.abs(start_area) > 1e-14 * max(
+                float(np.abs(start_area).max()), 1e-30)
+            if np.any(area[live_area] * start_area[live_area] <= 0.0):
+                continue
+            next_within, next_across, next_pairs = overlapping_pairs(
+                tl, candidate, lab, moved_faces, return_pairs=True)
+            next_tri = candidate[tl]
+            next_edge = np.stack([next_tri[:, 1] - next_tri[:, 0],
+                                  next_tri[:, 2] - next_tri[:, 1],
+                                  next_tri[:, 0] - next_tri[:, 2]], axis=1)
+            next_normals = np.stack([-next_edge[..., 1], next_edge[..., 0]], axis=-1)
+            next_axes = np.concatenate([next_normals[next_pairs[:, 0]],
+                                        next_normals[next_pairs[:, 1]]], axis=1)
+            next_axes /= np.maximum(np.linalg.norm(next_axes, axis=2)[..., None], 1e-30)
+            next_pa = np.einsum("pnc,pkc->pnk", next_tri[next_pairs[:, 0]], next_axes)
+            next_pb = np.einsum("pnc,pkc->pnk", next_tri[next_pairs[:, 1]], next_axes)
+            next_depth = np.minimum(next_pa.max(1) - next_pb.min(1),
+                                    next_pb.max(1) - next_pa.min(1))
+            next_cost = float(np.maximum(next_depth, 0.0).min(1).sum()) if len(next_pairs) else 0.0
+            if (next_within + next_across < current
+                    or (next_within + next_across == current
+                        and next_cost < current_cost - 1e-12 * max(current_cost, 1.0))):
+                out = candidate
+                within, across, pairs = next_within, next_across, next_pairs
+                final_within, final_across = within, across
+                rounds += 1
+                accepted = True
+                break
+        if not accepted:
+            break
+
+    return out, {"before": initial_count, "after": final_within + final_across,
+                 "rounds": rounds, "within": final_within, "across": final_across}

@@ -47,8 +47,8 @@ def _console_log(message):
 
 class UVRELAX_OT_relax(bpy.types.Operator):
     """Relax the selected part of a UV island.  Everything you did not select keeps its UV
-    coordinates exactly, so seams stay matched.  With Hold Border off, the islands you touched relax
-    whole instead, their own outline moving with them wherever nothing is matched to it"""
+    coordinates exactly, so seams stay matched.  A partial island selection keeps its untouched
+    UV points fixed; selecting a whole island relaxes its outer contour too."""
 
     bl_idname = "uv.relax_even"
     bl_label = "Relax Selection"
@@ -59,14 +59,6 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         description="How many refinements one island may make inside a single solve.  The island's "
                     "shape is worked out rather than walked towards, so this only decides how exact "
                     "that answer is; raise it on a big island whose report says it ran out")
-
-    pin_border: bpy.props.BoolProperty(
-        name="Hold Border", default=False,
-        description="On: a UV point only moves when every face around it is selected, so the "
-                    "edge of your selection is held exactly where it is.  Off: the islands you "
-                    "selected relax whole, including their outer contour, so sharp or badly "
-                    "unwrapped borders can be repaired.  Selecting nothing relaxes every island "
-                    "on the mesh")
 
     density_weight: bpy.props.FloatProperty(
         name="Density Balance", default=0.30, min=0.0, max=1.0, soft_max=0.5,
@@ -103,48 +95,38 @@ class UVRELAX_OT_relax(bpy.types.Operator):
 
         inv = core.uvvert_ids(tri, tuv)
         U = int(inv.max()) + 1
-        isl = core.islands(inv, U)[inv[:, 0]]
+        point_isl = core.islands(inv, U)
+        isl = point_isl[inv[:, 0]]
 
         sync = bool(context.tool_settings.use_uv_select_sync)
         sync_uv_valid = bool(sync and getattr(bm, "uv_select_sync_valid", False))
         selection_source = ("UV_CORNERS" if sync_uv_valid else "MESH") if sync else "UV"
         selection = bridge.selection_counts(bm, sync)
-        sel = bridge.selected_faces(bm, poly_of_tri, sync, context.tool_settings)
-        selection_present = bool(sel.any())
-        if self.pin_border or selection_present:
-            if not sel.any():
-                _console_log(
-                    "CANCEL object=%s mode=%s selected_verts=%d selected_edges=%d "
-                    "selected_faces=%d reason=empty_selection elapsed_ms=%.1f" %
-                    (context.active_object.name, "SYNC" if sync else "UV",
-                     selection["verts"], selection["edges"], selection["faces"],
-                     (time.perf_counter() - t0) * 1000.0))
-                self.report({"WARNING"}, "Nothing selected in the UV editor")
-                return {"CANCELLED"}
-            else:
-                labs = np.unique(isl[sel])
-                scope = sel.copy()
+        corner_selected = bridge.selected_corners(bm, lt, sync, context.tool_settings)
+        selected_uv = np.zeros(U, dtype=bool)
+        np.logical_or.at(selected_uv, inv.ravel(), corner_selected.ravel())
+        selection_present = bool(selected_uv.any())
+        if selection_present:
+            labs = np.unique(point_isl[selected_uv])
+            scope = np.any(selected_uv[inv], axis=1)
         else:
-            # Nothing is held by the selection: each island you touched relaxes whole, and the only
-            # thing held is that island's own outline, which the solve treats as boundary
-            # conditions rather than as material to spend.  An island you did not touch keeps its UV
-            # coordinates, and with nothing picked that is every island on the mesh.
-            labs = np.unique(isl[sel]) if sel.any() else np.unique(isl)
+            # With nothing picked, relax every island on the mesh.
+            labs = np.unique(point_isl)
             scope = np.isin(isl, labs)
 
         _console_log(
             "START object=%s mode=%s selected_verts=%d selected_edges=%d selected_faces=%d "
-            "scope_faces=%d islands=%d selection_source=%s steps=%d density=%.3f hold_border=%s" %
+            "scope_faces=%d islands=%d selection_source=%s steps=%d density=%.3f" %
             (context.active_object.name, "SYNC" if sync else "UV",
              selection["verts"], selection["edges"], selection["faces"],
              int(scope.sum()), len(labs),
              selection_source,
-             int(self.steps), float(self.density_weight),
-             bool(self.pin_border)))
+             int(self.steps), float(self.density_weight)))
         setup_ms = (time.perf_counter() - t0) * 1000.0 - read_ms
 
         pos = np.zeros((U, 2))
         pos[inv.ravel()] = tuv.reshape(-1, 2)
+        movable_uv = np.zeros(U, dtype=bool)
         # which UV points something else is matched to, so that holding them is what keeps a seam
         # together -- see core.glued_points
         glued = core.glued_points(tri, inv, isl)
@@ -161,6 +143,8 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         ran_out = 0
         took = 0
         solves = 0
+        solver_profile = {"model_ms": 0.0, "preconditioner_ms": 0.0,
+                          "cg_ms": 0.0, "line_search_ms": 0.0}
         reduced_islands = 0
         reduced_faces = 0
         reduced_points = 0
@@ -176,9 +160,9 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             remap[ids] = np.arange(len(ids))
             tl = remap[inv[f]]
 
-            selected_in_island = sel[f]
+            selected_in_island = selected_uv[ids]
             partial_island = bool(selected_in_island.any() and not selected_in_island.all())
-            local_mode = self.pin_border or partial_island
+            local_mode = partial_island
 
             edge = np.sort(np.concatenate([tl[:, [0, 1]], tl[:, [1, 2]],
                                            tl[:, [2, 0]]]), 1)
@@ -186,13 +170,9 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             rim = np.zeros(len(ids), bool)
             rim[uk[cnt == 1].ravel()] = True
             if local_mode:
-                # A point may move only when every face around it was selected.  That is what
-                # keeps the untouched part of the island, and any seam it shares, exactly where
-                # it is -- and it is also what lets a selected outline, hole rims included, take
-                # part in the relax instead of being locked because it happens to be an outline.
-                around = np.bincount(tl.ravel(), weights=np.repeat(~sel[f], 3),
-                                     minlength=len(ids))
-                free = around == 0
+                # Only UV points explicitly selected by the user may move.  All other points are
+                # exact Dirichlet conditions, including vertices on faces touching the selection.
+                free = selected_in_island.copy()
             else:
                 # The whole island relaxes, and the only part of its outline held where it stands is
                 # the part something else is matched to -- a seam side, or a point two islands were
@@ -218,7 +198,6 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                 # UV seams are intentional discontinuities.  Holding every seam
                 # vertex makes a sharp outer contour impossible to repair, so
                 # the whole-island path keeps the contour in the unknowns.
-                # `Hold Border` above remains the explicit fixed-boundary mode.
                 free = np.ones(len(ids), bool)
             if not free.any():
                 stuck += 1
@@ -281,6 +260,8 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                 solve_p, solve_tl, solve_uv, solve_pin, maxit=self.steps,
                 density_weight=self.density_weight,
                 boundary_weight=None, **solve_kwargs)
+            for key in solver_profile:
+                solver_profile[key] += st.get(key, 0.0)
             if st["pass"] == 0:
                 # an island whose every point is held by a face left out is a different
                 # answer from one that has settled, and saying the wrong one sends him
@@ -310,8 +291,10 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                 mirrored_faces += int(st["fold_left"])
             if reduced:
                 pos[ids[local_ids]] = newuv
+                movable_uv[ids[local_ids[free[local_ids]]]] = True
             else:
                 pos[ids] = newuv
+                movable_uv[ids[free]] = True
             moved_labs.append(lab)
             points += int(free.sum())
             relaxed += 1
@@ -347,6 +330,16 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             return {"CANCELLED"}
 
         solve_ms = (time.perf_counter() - solve_t0) * 1000.0
+        solver_profile["misc_ms"] = max(
+            0.0, solve_ms - sum(solver_profile.values()))
+        overlap_fix_t0 = time.perf_counter()
+        moved_faces = np.isin(isl, moved_labs)
+        overlap_initial = core.overlapping_pairs(
+            inv, pos, isl, moved=moved_faces, return_pairs=True)
+        pos, overlap_fix = core.untangle_overlaps(
+            inv, pos, movable_uv, isl, moved_faces=moved_faces,
+            initial=overlap_initial)
+        overlap_fix_ms = (time.perf_counter() - overlap_fix_t0) * 1000.0
         write_t0 = time.perf_counter()
         new_loop_uv = np.empty_like(uvs)
         new_loop_uv[lt.ravel()] = pos[inv.ravel()]
@@ -373,10 +366,8 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         # Every face of the mesh is looked at, not just the ones in scope, because an outline that
         # may move can grow into a neighbour that was never touched -- and a pair is only charged
         # against this button where one of its two faces sits on an island this button wrote back.
-        overlap_t0 = time.perf_counter()
-        within, across = core.overlapping_pairs(inv, pos, isl,
-                                                moved=np.isin(isl, moved_labs))
-        overlap_ms = (time.perf_counter() - overlap_t0) * 1000.0
+        within, across = overlap_fix["within"], overlap_fix["across"]
+        overlap_ms = overlap_fix_ms
         tail = ""
         if declined:
             tail += " | %d island(s) left alone: %d face(s) in them are turned the way round " \
@@ -395,25 +386,30 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             tail += " | %d face pair(s) still lie on top of each other inside one island, which " \
                     "only cutting a seam takes off" % within
         if across:
-            tail += " | %d face pair(s) now lie on top of a neighbouring island, because a border " \
-                    "that was allowed to move took the room -- repack, or turn Hold Border on" \
-                    % across
+            tail += " | %d face pair(s) now lie on top of a neighbouring island because a border " \
+                    "that moved took the room -- repack the UVs" % across
         post_ms = (time.perf_counter() - post_t0) * 1000.0
         ms = (time.perf_counter() - t0) * 1000.0
         _console_log(
             "DONE object=%s elapsed_ms=%.1f read_ms=%.1f setup_ms=%.1f solve_ms=%.1f "
             "write_ms=%.1f post_ms=%.1f metric_ms=%.1f overlap_ms=%.1f "
+            "solver_model_ms=%.1f precond_ms=%.1f cg_ms=%.1f density_line_ms=%.1f "
+            "solver_misc_ms=%.1f "
             "selected_verts=%d selected_edges=%d "
             "selected_faces=%d islands=%d relaxed_islands=%d reduced_islands=%d "
             "reduced_faces=%d reduced_points=%d points=%d solves=%d "
-            "cg_passes=%d selection_source=%s steps=%d density=%.3f hold_border=%s" %
+            "cg_passes=%d overlap_fix=%d->%d/%d "
+            "selection_source=%s steps=%d density=%.3f" %
             (context.active_object.name, ms, read_ms, setup_ms, solve_ms, write_ms, post_ms,
              metric_ms, overlap_ms,
+             solver_profile["model_ms"], solver_profile["preconditioner_ms"],
+             solver_profile["cg_ms"], solver_profile["line_search_ms"],
+             solver_profile["misc_ms"],
              selection["verts"], selection["edges"], selection["faces"], len(labs), relaxed,
              reduced_islands, reduced_faces, reduced_points, points, solves, took,
+             overlap_fix["before"], overlap_fix["after"], overlap_fix["rounds"],
              selection_source,
-             int(self.steps), float(self.density_weight),
-             bool(self.pin_border)))
+             int(self.steps), float(self.density_weight)))
         self.report({"WARNING" if (declined or stuck or ran_out or within or across) else "INFO"},
                     "%d UV points on %d island(s) relaxed in %.0f ms | stretch median %.3f "
                     "-> %.3f, worst 1%% %.2f -> %.2f | density CV %.3f -> %.3f, "

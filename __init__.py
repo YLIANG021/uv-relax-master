@@ -43,16 +43,6 @@ class UVRELAX_PT_preferences(bpy.types.AddonPreferences):
         name="Fade Matched Faces", default=False, description="Leave faces whose density "
         "already matches unpainted, so the texture shows through", update=_redraw_prop)
 
-    # the button's own settings live here, not on the operator: an operator property drawn in a
-    # panel is rebuilt from its default at every redraw, so it can never show a state and a click
-    # on it runs the operator instead of setting it
-    hold_border: bpy.props.BoolProperty(
-        name="Hold Border", default=False,
-        description="On: a UV point only moves when every face around it is selected, so the "
-                    "edge of your selection is held exactly where it is.  Off: the islands you "
-                    "selected relax whole, including their outer contour, so sharp or badly "
-                    "unwrapped borders can be repaired.  Selecting nothing relaxes every island "
-                    "on the mesh")
     steps: bpy.props.IntProperty(
         name="Steps", default=200, min=1, max=5000,
         description="How many refinements one island may make inside a single solve.  The island's "
@@ -70,7 +60,6 @@ class UVRELAX_PT_preferences(bpy.types.AddonPreferences):
                     "average density")
     def draw(self, context):
         col = self.layout.column(align=True)
-        col.prop(self, "hold_border")
         col.prop(self, "steps")
         col.prop(self, "density_weight")
         col.prop(self, "overlay_on")
@@ -92,10 +81,8 @@ class UVRELAX_PT_panel(bpy.types.Panel):
         row = layout.row(align=True)
         op = row.operator(relax.UVRELAX_OT_relax.bl_idname,
                           text="Relax Selection", icon='UV')
-        op.pin_border = prefs.hold_border
         op.steps = prefs.steps
         op.density_weight = prefs.density_weight
-        row.prop(prefs, "hold_border", text="", icon='LOCKED')
         layout.prop(prefs, "steps", text="Steps", slider=True)
         layout.prop(prefs, "density_weight", text="Density Balance", slider=True)
         box = layout.box()
