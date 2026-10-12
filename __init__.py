@@ -3,12 +3,13 @@ if "bpy" in locals():
     importlib.reload(core)  # noqa: F821
     importlib.reload(bridge)  # noqa: F821
     importlib.reload(relax)  # noqa: F821
+    importlib.reload(selection)  # noqa: F821
     from .display import overlay as _display_overlay
     importlib.reload(_display_overlay)
 
 import bpy
 
-from . import core, bridge, relax
+from . import core, bridge, relax, selection
 from .display import overlay
 
 
@@ -67,10 +68,18 @@ class UVRELAX_PT_panel(bpy.types.Panel):
         layout.prop(prefs, "steps", text="Steps", slider=True)
         layout.prop(prefs, "density_weight", text="Density Balance", slider=True)
         box = layout.box()
+        select_row = box.row(align=True)
+        interior = select_row.operator(selection.UVRELAX_OT_select_region.bl_idname,
+                                       text="Select Interior", icon='SELECT_INTERSECT')
+        interior.region = 'INTERIOR'
+        boundary = select_row.operator(selection.UVRELAX_OT_select_region.bl_idname,
+                                       text="Select Boundary", icon='SELECT_SET')
+        boundary.region = 'BOUNDARY'
         box.prop(prefs, "overlay_on", text="Density Overlay", icon='IMAGE_RGB')
 
 
 _classes = (relax.UVRELAX_OT_relax,
+            selection.UVRELAX_OT_select_region,
             UVRELAX_PT_preferences,
             UVRELAX_PT_panel)
 

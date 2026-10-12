@@ -106,13 +106,17 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         selected_uv = np.zeros(U, dtype=bool)
         np.logical_or.at(selected_uv, inv.ravel(), corner_selected.ravel())
         selection_present = bool(selected_uv.any())
-        if selection_present:
-            labs = np.unique(point_isl[selected_uv])
-            scope = np.any(selected_uv[inv], axis=1)
-        else:
-            # With nothing picked, relax every island on the mesh.
-            labs = np.unique(point_isl)
-            scope = np.isin(isl, labs)
+        if not selection_present:
+            _console_log(
+                "CANCEL object=%s mode=%s selected_verts=%d selected_edges=%d "
+                "selected_faces=%d reason=empty_selection elapsed_ms=%.1f" %
+                (context.active_object.name, "SYNC" if sync else "UV",
+                 selection["verts"], selection["edges"], selection["faces"],
+                 (time.perf_counter() - t0) * 1000.0))
+            self.report({"WARNING"}, "Nothing selected in the UV editor")
+            return {"CANCELLED"}
+        labs = np.unique(point_isl[selected_uv])
+        scope = np.any(selected_uv[inv], axis=1)
 
         _console_log(
             "START object=%s mode=%s selected_verts=%d selected_edges=%d selected_faces=%d "
@@ -127,9 +131,6 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         pos = np.zeros((U, 2))
         pos[inv.ravel()] = tuv.reshape(-1, 2)
         movable_uv = np.zeros(U, dtype=bool)
-        # which UV points something else is matched to, so that holding them is what keeps a seam
-        # together -- see core.glued_points
-        glued = core.glued_points(tri, inv, isl)
 
         relaxed = 0
         points = 0
@@ -164,11 +165,6 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             partial_island = bool(selected_in_island.any() and not selected_in_island.all())
             local_mode = partial_island
 
-            edge = np.sort(np.concatenate([tl[:, [0, 1]], tl[:, [1, 2]],
-                                           tl[:, [2, 0]]]), 1)
-            uk, cnt = np.unique(edge, axis=0, return_counts=True)
-            rim = np.zeros(len(ids), bool)
-            rim[uk[cnt == 1].ravel()] = True
             if local_mode:
                 # Only UV points explicitly selected by the user may move.  All other points are
                 # exact Dirichlet conditions, including vertices on faces touching the selection.
@@ -190,11 +186,6 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                 # rather than a wall that cannot be moved either way.  An island with no interior
                 # point -- one face, a two-face strip -- has no outline to hold and would freeze
                 # completely, so those still relax whole.
-                edge = np.sort(np.concatenate([tl[:, [0, 1]], tl[:, [1, 2]],
-                                               tl[:, [2, 0]]]), 1)
-                uk, cnt = np.unique(edge, axis=0, return_counts=True)
-                rim = np.zeros(len(ids), bool)
-                rim[uk[cnt == 1].ravel()] = True
                 # UV seams are intentional discontinuities.  Holding every seam
                 # vertex makes a sharp outer contour impossible to repair, so
                 # the whole-island path keeps the contour in the unknowns.
