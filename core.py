@@ -966,11 +966,11 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
     same = lab[a] == lab[b]
 
     def narrow(ii):
-        """Separating-axis test over the listed pairs, in blocks."""
-        hits = 0
-        pair_blocks = []
+        """Return the indices of overlapping candidates after the separating-axis test."""
+        hit_blocks = []
         for s in range(0, len(ii), block):
-            pa, pb = a[ii[s:s + block]], b[ii[s:s + block]]
+            batch = ii[s:s + block]
+            pa, pb = a[batch], b[batch]
             ta, tb = t[pa], t[pb]
             ax = np.concatenate([edge_normals[pa], edge_normals[pb]], 1)
             ga = np.einsum("pnc,pkc->pnk", ta, ax)
@@ -981,19 +981,27 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
             # tolerance measured on those would let the stamp pass for clean
             slack = 0.05 * np.minimum(scale[pa], scale[pb])[:, None]
             hit = (gap > slack).all(1)
-            hits += int(hit.sum())
-            if return_pairs and hit.any():
-                pair_blocks.append(np.stack([f[pa[hit]], f[pb[hit]]], axis=1))
-        pairs = (np.concatenate(pair_blocks) if pair_blocks
-                 else np.zeros((0, 2), np.int64))
-        return hits, pairs
+            if hit.any():
+                hit_blocks.append(batch[hit])
+        return (np.concatenate(hit_blocks) if hit_blocks
+                else np.zeros(0, np.int64))
 
-    same_count, same_pairs = narrow(np.flatnonzero(same))
-    if mv is None:
-        across_count, across_pairs = 0, np.zeros((0, 2), np.int64)
-    else:
-        across_count, across_pairs = narrow(np.flatnonzero(~same))
+    # The SAT projection is independent of the island-label split. Run it once, then split the
+    # surviving indices; the previous implementation projected the same candidates twice whenever
+    # both within-island and across-island checks were enabled.
+    sat_candidates = (np.arange(len(a), dtype=np.int64) if mv is not None
+                      else np.flatnonzero(same))
+    hit_idx = narrow(sat_candidates)
+    same_hit = same[hit_idx]
+    same_idx = hit_idx[same_hit]
+    across_idx = hit_idx[~same_hit] if mv is not None else np.zeros(0, np.int64)
+    same_count = int(same_hit.sum())
+    across_count = int((~same_hit).sum()) if mv is not None else 0
     if return_pairs:
+        same_pairs = np.stack([f[a[same_idx]], f[b[same_idx]]], axis=1) \
+            if len(same_idx) else np.zeros((0, 2), np.int64)
+        across_pairs = np.stack([f[a[across_idx]], f[b[across_idx]]], axis=1) \
+            if len(across_idx) else np.zeros((0, 2), np.int64)
         return same_count, across_count, np.concatenate([same_pairs, across_pairs])
     return same_count, across_count
 
@@ -1057,20 +1065,29 @@ def untangle_overlaps(tl, u, movable, lab=None, max_rounds=6,
 
         delta = np.zeros_like(out)
         weight = np.zeros(len(out))
-        for k, (a, b) in enumerate(pairs):
-            free_a = tl[a, movable[tl[a]]]
-            free_b = tl[b, movable[tl[b]]]
-            if not len(free_a) and not len(free_b):
-                continue
-            share_a = 1.0 if not len(free_b) else (0.5 if len(free_a) else 0.0)
-            share_b = 1.0 if not len(free_a) else (0.5 if len(free_b) else 0.0)
-            push = min(float(depth[k, axis_id[k]]) + max_step * 0.1, max_step)
-            if len(free_a):
-                np.add.at(delta, free_a, -axis[k] * (push * share_a))
-                np.add.at(weight, free_a, 1.0)
-            if len(free_b):
-                np.add.at(delta, free_b, axis[k] * (push * share_b))
-                np.add.at(weight, free_b, 1.0)
+        # Each pair contributes to at most three corners on each side. Keep the original per-pair
+        # sharing rule, but gather all free corner occurrences and scatter them in two vectorized
+        # passes instead of running Python and np.add.at once per pair.
+        verts_a, verts_b = tl[fa], tl[fb]
+        free_mask_a = movable[verts_a]
+        free_mask_b = movable[verts_b]
+        count_a = free_mask_a.sum(1)
+        count_b = free_mask_b.sum(1)
+        share_a = np.where(count_b == 0, 1.0, np.where(count_a > 0, 0.5, 0.0))
+        share_b = np.where(count_a == 0, 1.0, np.where(count_b > 0, 0.5, 0.0))
+        push = np.minimum(depth[np.arange(len(pairs)), axis_id] + max_step * 0.1, max_step)
+        contrib_a = -axis * (push * share_a)[:, None]
+        contrib_b = axis * (push * share_b)[:, None]
+        if free_mask_a.any():
+            ids_a = verts_a[free_mask_a]
+            np.add.at(delta, ids_a, np.broadcast_to(contrib_a[:, None, :],
+                                                    free_mask_a.shape + (2,))[free_mask_a])
+            np.add.at(weight, ids_a, 1.0)
+        if free_mask_b.any():
+            ids_b = verts_b[free_mask_b]
+            np.add.at(delta, ids_b, np.broadcast_to(contrib_b[:, None, :],
+                                                    free_mask_b.shape + (2,))[free_mask_b])
+            np.add.at(weight, ids_b, 1.0)
         valid = weight > 0.0
         if not valid.any():
             break
