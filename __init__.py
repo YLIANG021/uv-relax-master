@@ -13,8 +13,7 @@ from .display import overlay
 
 
 def _redraw_prop(self, _context):
-    # every pref that updates through here only decides how the triangles are painted, so the
-    # geometry that is already read stays good
+    # Toggling the overlay only changes whether the cached paint is shown.
     if self.overlay_on:
         overlay.invalidate_colors()
     else:
@@ -28,20 +27,6 @@ class UVRELAX_PT_preferences(bpy.types.AddonPreferences):
         name="Density Overlay", default=False, description="Colour each UV face by how much "
         "texel space it got compared to the average of the island it is on",
         update=_redraw_prop)
-    span: bpy.props.FloatProperty(
-        name="Range", default=1.0, min=0.2, max=4.0, soft_max=2.0,
-        description="How far a face's density ratio has to sit from 1.0 to reach full red or "
-                    "full blue.  1.0 is the reference bar: red at 0, grey at 1, blue at 2",
-        update=_redraw_prop)
-    alpha: bpy.props.FloatProperty(
-        name="Opacity", default=0.55, min=0.05, max=1.0, update=_redraw_prop)
-    brightness: bpy.props.FloatProperty(
-        name="Brightness", default=1.0, min=0.0, max=2.0, soft_max=1.5,
-        description="Multiply overlay colours without changing their opacity",
-        update=_redraw_prop)
-    fade_grey: bpy.props.BoolProperty(
-        name="Fade Matched Faces", default=False, description="Leave faces whose density "
-        "already matches unpainted, so the texture shows through", update=_redraw_prop)
 
     steps: bpy.props.IntProperty(
         name="Steps", default=200, min=1, max=5000,
@@ -63,10 +48,6 @@ class UVRELAX_PT_preferences(bpy.types.AddonPreferences):
         col.prop(self, "steps")
         col.prop(self, "density_weight")
         col.prop(self, "overlay_on")
-        col.prop(self, "span", slider=True)
-        col.prop(self, "alpha", slider=True)
-        col.prop(self, "brightness", slider=True)
-        col.prop(self, "fade_grey")
 
 
 class UVRELAX_PT_panel(bpy.types.Panel):
@@ -87,16 +68,6 @@ class UVRELAX_PT_panel(bpy.types.Panel):
         layout.prop(prefs, "density_weight", text="Density Balance", slider=True)
         box = layout.box()
         box.prop(prefs, "overlay_on", text="Density Overlay", icon='IMAGE_RGB')
-        sub = box.column(align=True)
-        sub.active = prefs.overlay_on
-        sub.prop(prefs, "span", text="Range", slider=True)
-        sub.prop(prefs, "alpha", text="Opacity", slider=True)
-        sub.prop(prefs, "brightness", text="Brightness", slider=True)
-        sub.prop(prefs, "fade_grey")
-        if prefs.overlay_on:
-            row = box.row(align=True)
-            row.scale_y = 0.8
-            row.label(text="Red = too little UV   Blue = too much", icon='INFO')
 
 
 _classes = (relax.UVRELAX_OT_relax,

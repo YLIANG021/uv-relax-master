@@ -14,6 +14,9 @@ _ADDON_PACKAGE = __package__.rpartition(".")[0]
 GRAY = (0.470, 0.460, 0.455)
 TOO_LITTLE = (0.760, 0.024, 0.028)   # red:  this face has too little UV for its 3D area
 TOO_MUCH = (0.043, 0.357, 0.745)     # blue: this face has more UV than it needs
+OVERLAY_SPAN = 1.40
+OVERLAY_ALPHA = 0.65
+OVERLAY_BRIGHTNESS = 1.20
 
 MAX_TRIANGLES = 400000
 # Delay after the last edit event before rebuilding the overlay.  A continuous drag keeps
@@ -22,7 +25,7 @@ REFRESH_INTERVAL = 0.1
 
 _shader = None
 # The UVO-style cache has two layers: per-object geometry/density data, and the single GPU batch
-# painted from it.  A colour preference only rebuilds the latter.
+# painted from it.
 _obj_cache = {}
 _geom = None
 _batch = None
@@ -84,20 +87,18 @@ def log_ratio(co, tri, lt, uvs, model=None):
     return tuv, per_point[inv], model
 
 
-def colors(lg, span, alpha, fade_grey, brightness):
+def colors(lg):
     """The reference bar's mapping: the density ratio itself read on a linear scale, grey at
-    1.0, full red at 1-span (0 with the default span) and full blue at 1+span (2), clamped
-    past both ends.  lg still arrives as log2 of the ratio because that is what comes out of
-    the point averaging, so it is turned back into a ratio here."""
-    t = np.clip((np.exp2(lg) - 1.0) / max(span, 1e-3), -1.0, 1.0)
+    1.0, full red at 1-OVERLAY_SPAN and full blue at 1+OVERLAY_SPAN, clamped past both ends.
+    lg still arrives as log2 of the ratio because that is what comes out of the point averaging,
+    so it is turned back into a ratio here."""
+    t = np.clip((np.exp2(lg) - 1.0) / OVERLAY_SPAN, -1.0, 1.0)
     m = np.abs(t)
     target = np.where(t[:, None] < 0.0, np.array(TOO_LITTLE), np.array(TOO_MUCH))
     out = np.empty((len(t), 4), np.float32)
     out[:, :3] = m[:, None] * target + (1.0 - m[:, None]) * np.array(GRAY)
-    out[:, :3] = np.clip(out[:, :3] * brightness, 0.0, 1.0)
-    out[:, 3] = alpha
-    if fade_grey:
-        out[:, 3] = alpha * np.minimum(m * 8.0, 1.0)
+    out[:, :3] = np.clip(out[:, :3] * OVERLAY_BRIGHTNESS, 0.0, 1.0)
+    out[:, 3] = OVERLAY_ALPHA
     return out
 
 
@@ -179,7 +180,7 @@ def read_geometry(objects=None):
     return out or None
 
 
-def paint(geom, prefs):
+def paint(geom):
     """The cheap half: one batch out of cached geometry.
 
     The arrays go to batch_for_shader as they are -- attr_fill takes numpy, so turning them
@@ -187,9 +188,7 @@ def paint(geom, prefs):
     290k vertices."""
     global _batch, _vbo, _vbo_count, _vbo_pos_id, _vbo_color_id
     positions = np.concatenate([g[0] for g in geom])
-    color_data = np.concatenate([colors(g[1], prefs.span, prefs.alpha, prefs.fade_grey,
-                                         prefs.brightness)
-                                 for g in geom])
+    color_data = np.concatenate([colors(g[1]) for g in geom])
     if _vbo is None or _batch is None or _vbo_count != len(positions):
         from gpu.types import GPUBatch, GPUVertBuf, GPUVertFormat
         fmt = GPUVertFormat()
@@ -203,11 +202,10 @@ def paint(geom, prefs):
     return _batch
 
 
-def rebuild(prefs):
+def rebuild():
     """One batch holding every edited mesh, rebuilt only when something changed."""
     global _geom, _batch, _col_key, _dirty
-    key = (round(prefs.span, 3), round(prefs.alpha, 3), prefs.fade_grey,
-           round(prefs.brightness, 3))
+    key = (OVERLAY_SPAN, OVERLAY_ALPHA, OVERLAY_BRIGHTNESS)
     if _batch is not None and not _dirty and key == _col_key:
         return _batch
 
@@ -219,7 +217,7 @@ def rebuild(prefs):
         _batch = None
     if _geom is None:
         return None
-    _batch = paint(_geom, prefs)
+    _batch = paint(_geom)
     _col_key = key
     return _batch
 
@@ -246,7 +244,7 @@ def draw():
     prefs = addon.preferences
     if not prefs.overlay_on:
         return
-    batch = rebuild(prefs)
+    batch = rebuild()
     if batch is None:
         return
     shader = get_shader()
@@ -312,9 +310,7 @@ def invalidate():
 
 
 def invalidate_colors():
-    """Mark only the painting stale.  A colour pref cannot move a triangle, so the geometry
-    already read is still good and the edit mesh does not get walked again -- dragging the
-    Range or Opacity slider repaints instead of re-reading."""
+    """Mark the painted layer stale without changing the cached geometry."""
     global _col_key
     _col_key = None
     tag_uv_redraw()
