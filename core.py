@@ -395,16 +395,20 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             np.add.at(out, ids, gs.reshape(-1, 2, 2))
         return out
 
+    ask_cache = {}
+
     def ask(e_side):
         """An orientation trial's fixed coefficients: every face asked for `e_side` (+1, -1) or for
         the way round it already is (None)."""
-        A, w = stretch_terms(p, uv0[tl], e_side=e_side)
-        w = w * conf_norm
-        if e_side is None:
-            signs = np.where(sg == 0.0, 1.0, sg)
-        else:
-            signs = np.full(len(q0), float(e_side))
-        return A, w, signs
+        if e_side not in ask_cache:
+            A, w = stretch_terms(p, uv0[tl], e_side=e_side)
+            w = w * conf_norm
+            if e_side is None:
+                signs = np.where(sg == 0.0, 1.0, sg)
+            else:
+                signs = np.full(len(q0), float(e_side))
+            ask_cache[e_side] = (A, w, signs)
+        return ask_cache[e_side]
 
     def area_grad(u):
         """d(UV double area)/d(each corner), (T,3,2) -- linear in the corners, because the area
@@ -477,6 +481,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         L[:, 1] = d / length2[:, None]
         return L, np.einsum("eij,eij->e", L, base[boundary_edges]) - err
 
+    conformal_cache = {}
+
     def system(A, w, signs, base, dens, boundary_factor=1.0):
         """The quadratic that stands in for the objective at `base`: Hessian-times-vector, the
         Hessian's diagonal, the constant part of its gradient, and a function that scores any state
@@ -505,9 +511,15 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 out = out + scatter_edges((2.0 * wb * db)[:, None, None] * Lb)
             return out
 
-        face_blocks = 2.0 * w[:, None, None, None] * np.einsum(
-            "tkci,tkcj->tcij", A, A)
-        dg = np.diagonal(face_blocks, axis1=2, axis2=3)
+        cache_key = (id(A), id(w))
+        if cache_key not in conformal_cache:
+            conformal_blocks = 2.0 * w[:, None, None, None] * np.einsum(
+                "tkci,tkcj->tcij", A, A)
+            conformal_cache[cache_key] = (
+                conformal_blocks, np.diagonal(conformal_blocks, axis1=2, axis2=3))
+        conformal_blocks, conformal_diag = conformal_cache[cache_key]
+        face_blocks = conformal_blocks.copy() if dens else conformal_blocks
+        dg = conformal_diag.copy() if dens else conformal_diag
         c0 = np.zeros((V, 2))
         if dens:
             L, r = density_lin(signs, base)
@@ -944,13 +956,12 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
     ii = np.repeat(np.arange(n), cnt)
     jj = ii + 1 + (np.arange(total) - np.repeat(starts, cnt))
     a, b = order[ii], order[jj]
-    # with `moved` given, a pair is only charged against this run where one of its two faces sits on
-    # an island the run wrote back -- and then a pair of two *different* islands counts too, which is
-    # what an outline set free can grow into.  Two islands that were already on top of each other
-    # before the button was pressed are not the button's doing.
-    sel = (box[a, 1, 1] > box[b, 0, 1]) & (box[b, 1, 1] > box[a, 0, 1])
+    # Pairs without a moved face cannot be caused by this run. Filter them before the y-box and SAT
+    # checks so only relevant candidates reach the later stages.
     if mv is not None:
-        sel &= mv[a] | mv[b]
+        moved_pair = mv[a] | mv[b]
+        a, b = a[moved_pair], b[moved_pair]
+    sel = (box[a, 1, 1] > box[b, 0, 1]) & (box[b, 1, 1] > box[a, 0, 1])
     a, b = a[sel], b[sel]
     same = lab[a] == lab[b]
 
