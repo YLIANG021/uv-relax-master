@@ -498,13 +498,14 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         boundary_diag = np.zeros((V, 2))
 
         def hvp(v):
-            d = np.einsum("tkcv,tcv->tk", A, v[tl])
+            face_v = v[tl]
+            d = np.einsum("tkcv,tcv->tk", A, face_v)
             gs = np.einsum("tkcv,tk->tcv", A, d) * (2.0 * w)[:, None, None]
             if lin is None:
                 out = scatter(gs)
             else:
                 L, _ = lin
-                out = scatter(gs + (2.0 * wd * np.einsum("tcv,tcv->t", L, v[tl]))[:, None, None] * L)
+                out = scatter(gs + (2.0 * wd * np.einsum("tcv,tcv->t", L, face_v))[:, None, None] * L)
             if blin is not None:
                 Lb, _ = blin
                 db = np.einsum("eij,eij->e", Lb, v[boundary_edges])
@@ -627,6 +628,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         cen = v.mean(0)
         return (v - cen) * np.sqrt(area2_0 / now) + cen
 
+    projection_cache = {}
+
     def solve(A, w, signs, clamp, base, dens, tol=1e-6, model=None):
         """One global move over every point not held by selection or a fold clamp.
 
@@ -645,31 +648,32 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         elif scale_gauge is not None:
             basis = scale_gauge
 
-        # Build the small projection basis once per linear solve.  The old path recomputed a
-        # least-squares fit over every UV point for every CG vector; the basis is fixed while this
-        # solve runs, so a QR factorization gives the same orthogonal projection with two cheap
-        # matrix-vector products per iteration.
-        projector = None
-        if basis is not None:
-            M = basis[active].reshape(-1, basis.shape[2])
-            if len(M):
-                Q, _ = np.linalg.qr(M, mode="reduced")
-                projector = Q
+        # Only the active set and the fixed gauge basis determine this projection. Reuse its
+        # indices and QR across density rounds; a different fold clamp gets a separate entry.
+        projection_key = (id(basis), active.tobytes())
+        if projection_key not in projection_cache:
+            active_ids = np.flatnonzero(active)
+            inactive_ids = np.flatnonzero(~active)
+            projector = None
+            if basis is not None and len(active_ids):
+                M = basis[active_ids].reshape(-1, basis.shape[2])
+                projector, _ = np.linalg.qr(M, mode="reduced")
+            projection_cache[projection_key] = (active_ids, inactive_ids, projector)
+        active_ids, inactive_ids, projector = projection_cache[projection_key]
 
         def project(v):
             if projector is None:
                 return v * live
-            out = v.copy()
-            out[~active] = 0.0
-            flat = out[active].reshape(-1)
+            out = np.zeros_like(v)
+            flat = v[active_ids].reshape(-1)
             if len(flat):
-                out[active] = (flat - projector @ (projector.T @ flat)).reshape(-1, 2)
+                out[active_ids] = (flat - projector @ (projector.T @ flat)).reshape(-1, 2)
             return out
 
         inv_diag = live / np.maximum(diag, 1e-30)
         block_inv = np.zeros_like(block_diag)
-        if active.any():
-            blocks = block_diag[active]
+        if len(active_ids):
+            blocks = block_diag[active_ids]
             scale = np.maximum(np.max(np.abs(blocks), axis=(1, 2)), 1e-30)
             det = blocks[:, 0, 0] * blocks[:, 1, 1] - blocks[:, 0, 1] * blocks[:, 1, 0]
             good = det > 1e-12 * scale * scale
@@ -681,16 +685,16 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 inverse[:, 1, 1] = selected[:, 0, 0] * inv_det
                 inverse[:, 0, 1] = -selected[:, 0, 1] * inv_det
                 inverse[:, 1, 0] = -selected[:, 1, 0] * inv_det
-                active_ids = np.flatnonzero(active)
                 block_inv[active_ids[good]] = inverse
         fallback = active & (np.max(np.abs(block_inv), axis=(1, 2)) <= 0.0)
+        fallback_ids = np.flatnonzero(fallback)
 
         def precondition(v):
             """Apply a per-UV-point 2x2 Jacobi block, with scalar fallback for flat points."""
             out = np.einsum("vij,vj->vi", block_inv, v)
-            if fallback.any():
-                out[fallback] = v[fallback] * inv_diag[fallback]
-            out[~active] = 0.0
+            if len(fallback_ids):
+                out[fallback_ids] = v[fallback_ids] * inv_diag[fallback_ids]
+            out[inactive_ids] = 0.0
             return out
 
         profile["preconditioner_ms"] += (time.perf_counter() - preconditioner_t0) * 1000.0
@@ -972,7 +976,9 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
             batch = ii[s:s + block]
             pa, pb = a[batch], b[batch]
             ta, tb = t[pa], t[pb]
-            ax = np.concatenate([edge_normals[pa], edge_normals[pb]], 1)
+            # Any separating axis rejects the pair. Check A's three axes first so rejected
+            # candidates never allocate projections onto B's axes.
+            ax = edge_normals[pa]
             ga = np.einsum("pnc,pkc->pnk", ta, ax)
             gb = np.einsum("pnc,pkc->pnk", tb, ax)
             gap = np.minimum(ga.max(1), gb.max(1)) - np.maximum(ga.min(1), gb.min(1))
@@ -981,14 +987,21 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
             # tolerance measured on those would let the stamp pass for clean
             slack = 0.05 * np.minimum(scale[pa], scale[pb])[:, None]
             hit = (gap > slack).all(1)
-            if hit.any():
-                hit_blocks.append(batch[hit])
+            if not hit.any():
+                continue
+            batch = batch[hit]
+            ax = edge_normals[pb[hit]]
+            ga = np.einsum("pnc,pkc->pnk", ta[hit], ax)
+            gb = np.einsum("pnc,pkc->pnk", tb[hit], ax)
+            gap = np.minimum(ga.max(1), gb.max(1)) - np.maximum(ga.min(1), gb.min(1))
+            hit_b = (gap > slack[hit]).all(1)
+            if hit_b.any():
+                hit_blocks.append(batch[hit_b])
         return (np.concatenate(hit_blocks) if hit_blocks
                 else np.zeros(0, np.int64))
 
-    # The SAT projection is independent of the island-label split. Run it once, then split the
-    # surviving indices; the previous implementation projected the same candidates twice whenever
-    # both within-island and across-island checks were enabled.
+    # The SAT projection is independent of the island-label split. Process candidates together,
+    # then split the surviving indices into within-island and across-island results.
     sat_candidates = (np.arange(len(a), dtype=np.int64) if mv is not None
                       else np.flatnonzero(same))
     hit_idx = narrow(sat_candidates)

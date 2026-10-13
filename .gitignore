@@ -1,0 +1,13 @@
+# Markdown notes and documents
+*.md
+
+# Python bytecode and cache directories
+__pycache__/
+*.py[cod]
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local add-on packaging script
+/Addon_pack.vbs
