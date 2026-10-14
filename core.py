@@ -6,6 +6,87 @@ import time
 import numpy as np
 
 
+# Small, bounded caches for data whose identity is determined by the mesh arrays.  Blender
+# recreates the arrays on edit, so the byte signatures keep stale topology or 3D metrics from being
+# reused while still avoiding repeated global numpy work during ordinary UV-only edits.
+_TOPOLOGY_CACHE = {}
+_GEOMETRY_CACHE = {}
+_BOUNDARY_CACHE = {}
+
+
+def _array_digest(array):
+    array = np.ascontiguousarray(array)
+    return (array.shape, array.dtype.str, hash(array.tobytes()))
+
+
+def cached_uv_topology(tri, tuv, limit=4):
+    """Return UV point ids and island labels, reusing unchanged mesh/UV seam topology."""
+    tri = np.asarray(tri)
+    tuv = np.asarray(tuv)
+    quantized_uv = np.rint(tuv * 1e5).astype(np.int64)
+    key = _array_digest(tri)
+    entries = _TOPOLOGY_CACHE.setdefault(key, [])
+    corner_uv = quantized_uv.reshape(-1, 2)
+    corner_vertex = tri.reshape(-1)
+    for entry in entries:
+        inv, point_isl, point_vertex, first_corner = entry
+        representative_uv = corner_uv[first_corner]
+        # A changed value is harmless when every corner belonging to a cached UV point changed
+        # together.  This catches a split point without rebuilding the global unique table.
+        if not np.array_equal(corner_uv, representative_uv[inv.reshape(-1)]):
+            continue
+        # Conversely, two previously separate points must not have become coincident on the same
+        # model vertex.  The check is over one representative per UV point, not every corner.
+        point_keys = np.concatenate([point_vertex[:, None], representative_uv], axis=1)
+        if len(np.unique(point_keys, axis=0)) != len(point_vertex):
+            continue
+        return inv, point_isl
+
+    inv = uvvert_ids(tri, tuv)
+    U = int(inv.max()) + 1
+    point_isl = islands(inv, U)
+    inv_flat = inv.reshape(-1)
+    # np.unique returns the point ids in its first result and corner indices in its second.
+    point_ids, first = np.unique(inv_flat, return_index=True)
+    first_corner = np.zeros(U, np.int64)
+    first_corner[point_ids] = first
+    point_vertex = np.zeros(U, np.int64)
+    point_vertex[point_ids] = corner_vertex[first]
+    entries.append((inv, point_isl, point_vertex, first_corner))
+    while len(entries) > limit:
+        entries.pop(0)
+    while len(_TOPOLOGY_CACHE) > limit:
+        _TOPOLOGY_CACHE.pop(next(iter(_TOPOLOGY_CACHE)))
+    return inv, point_isl
+
+
+def cached_uv_geometry(co, tri, limit=4):
+    """Return 3D corners, areas, and metric basis for an unchanged triangulated mesh."""
+    co = np.asarray(co)
+    tri = np.asarray(tri)
+    key = (_array_digest(co), _array_digest(tri))
+    cached = _GEOMETRY_CACHE.get(key)
+    if cached is None:
+        p, a3 = uv3d(co, tri)
+        cached = (p, a3, face_metric_prep(p))
+        _GEOMETRY_CACHE[key] = cached
+        while len(_GEOMETRY_CACHE) > limit:
+            _GEOMETRY_CACHE.pop(next(iter(_GEOMETRY_CACHE)))
+    return cached
+
+
+def cached_boundary_geometry(p, tl, limit=8):
+    """Return a triangulated region's 3D boundary geometry from a bounded cache."""
+    key = (_array_digest(p), _array_digest(tl))
+    cached = _BOUNDARY_CACHE.get(key)
+    if cached is None:
+        cached = boundary_geometry(p, tl)
+        _BOUNDARY_CACHE[key] = cached
+        while len(_BOUNDARY_CACHE) > limit:
+            _BOUNDARY_CACHE.pop(next(iter(_BOUNDARY_CACHE)))
+    return cached
+
+
 def face_metric_prep(p):
     """Precompute the model-only part of face_metric: Ginv @ TN.
 
@@ -1218,8 +1299,40 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
     return at[:output_V].copy(), stats
 
 
+def _refresh_overlap_cache(cache, tl, u, lab, moved):
+    """Keep face boxes, SAT normals, and scales for faces that did not move.
+
+    The cache is deliberately supplied by one relax operation rather than kept globally.  UV edits
+    made between operator runs therefore cannot leave stale boxes behind, while the repeated
+    overlap rounds in one run avoid rebuilding the stationary part of the spatial data.
+    """
+    key = (id(tl), id(lab) if lab is not None else None, len(tl))
+    if cache.get("key") != key:
+        t = u[tl]
+        area2 = signed_uv_area(t)
+        edges = np.stack([t[:, 1] - t[:, 0], t[:, 2] - t[:, 1],
+                          t[:, 0] - t[:, 2]], 1)
+        normals = np.stack([-edges[..., 1], edges[..., 0]], -1)
+        scale = np.sqrt(2.0 * np.abs(area2) / 1.7320508) + 1e-30
+        cache.clear()
+        cache.update({"key": key, "area2": area2, "box": np.stack([t.min(1), t.max(1)], 1),
+                      "normals": normals, "scale": scale})
+        return
+    ids = np.arange(len(tl), dtype=np.int64) if moved is None else np.flatnonzero(moved)
+    if not len(ids):
+        return
+    t = u[tl[ids]]
+    area2 = signed_uv_area(t)
+    edges = np.stack([t[:, 1] - t[:, 0], t[:, 2] - t[:, 1],
+                      t[:, 0] - t[:, 2]], 1)
+    cache["area2"][ids] = area2
+    cache["box"][ids] = np.stack([t.min(1), t.max(1)], 1)
+    cache["normals"][ids] = np.stack([-edges[..., 1], edges[..., 0]], -1)
+    cache["scale"][ids] = np.sqrt(2.0 * np.abs(area2) / 1.7320508) + 1e-30
+
+
 def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
-                      return_pairs=False):
+                      return_pairs=False, overlap_cache=None):
     """How many pairs of these faces lie on top of each other in UV.
 
     The relaxed energy cannot see this: it asks each face to be a good similarity of itself and is
@@ -1248,8 +1361,15 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
     are different problems: the first is opened by a seam, the second by the packer.
     Returns (pairs within one island, pairs across islands); with `return_pairs`, also returns
     the matching face-index pairs, with the within-island pairs first."""
+    if overlap_cache is None:
+        overlap_cache = {}
+    _refresh_overlap_cache(overlap_cache, tl, u, lab, moved)
+    area2_all = overlap_cache["area2"]
+    box_all = overlap_cache["box"]
+    edge_normals_all = overlap_cache["normals"]
+    scale_all = overlap_cache["scale"]
     t = u[tl]
-    area2 = signed_uv_area(t)
+    area2 = area2_all
     biggest = float(np.abs(area2).max()) if len(area2) else 0.0
     f = np.flatnonzero(np.abs(area2) > 1e-12 * max(biggest, 1e-30))
     if f.size < 2:
@@ -1259,30 +1379,58 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
     n = len(t)
     lab = np.zeros(n, np.int64) if lab is None else np.asarray(lab)[f]
     mv = None if moved is None else np.asarray(moved)[f]
-    box = np.stack([t.min(1), t.max(1)], 1)
-    edge_vectors = np.stack([t[:, 1] - t[:, 0], t[:, 2] - t[:, 1],
-                             t[:, 0] - t[:, 2]], 1)
-    edge_normals = np.stack([-edge_vectors[..., 1], edge_vectors[..., 0]], -1)
+    box = box_all[f]
+    edge_normals = edge_normals_all[f]
     # each face's own size, from its area: the edge of an equilateral triangle of double area S is
     # sqrt(2 S / sqrt 3)
-    scale = np.sqrt(2.0 * np.abs(area2[f]) / 1.7320508) + 1e-30
-    order = np.argsort(box[:, 0, 0])
-    left = box[order, 0, 0]
-    ends = np.searchsorted(left, box[order, 1, 0], side="right")
-    cnt = np.clip(ends - np.arange(n) - 1, 0, window)
-    total = int(cnt.sum())
-    if total == 0:
+    scale = scale_all[f]
+    def sweep_candidates(indices):
+        """Build the old bounded x-sweep for a compact set of face indices."""
+        if len(indices) < 2:
+            return np.zeros(0, np.int64), np.zeros(0, np.int64)
+        local_order = indices[np.argsort(box[indices, 0, 0])]
+        left = box[local_order, 0, 0]
+        ends = np.searchsorted(left, box[local_order, 1, 0], side="right")
+        cnt = np.clip(ends - np.arange(len(indices)) - 1, 0, window)
+        total = int(cnt.sum())
+        if total == 0:
+            return np.zeros(0, np.int64), np.zeros(0, np.int64)
+        starts = np.cumsum(cnt) - cnt
+        ii = np.repeat(np.arange(len(indices)), cnt)
+        jj = ii + 1 + (np.arange(total) - np.repeat(starts, cnt))
+        return local_order[ii], local_order[jj]
+
+    if mv is None or int(mv.sum()) >= max(2, n // 2):
+        # Dense/full-island path: one sweep over all valid faces, preserving the original cap.
+        a, b = sweep_candidates(np.arange(n, dtype=np.int64))
+    else:
+        # Sparse path: stationary boxes stay in the cached x index.  Only moved faces are queried
+        # against that index; the moved subset is swept separately so no pair is duplicated.
+        moving = np.flatnonzero(mv)
+        stationary = np.flatnonzero(~mv)
+        aa, bb = sweep_candidates(moving)
+        cross = []
+        if len(stationary):
+            static_order = stationary[np.argsort(box[stationary, 0, 0])]
+            static_left = box[static_order, 0, 0]
+            for face in moving.tolist():
+                start = int(np.searchsorted(static_left, box[face, 0, 0], side="left"))
+                end = int(np.searchsorted(static_left, box[face, 1, 0], side="right"))
+                lo = max(0, start - window)
+                cand = static_order[lo:min(end, lo + window)]
+                if len(cand):
+                    cand = cand[box[cand, 1, 0] > box[face, 0, 0]]
+                if len(cand):
+                    cross.append(np.stack([np.full(len(cand), face, np.int64), cand], 1))
+        if cross:
+            cross = np.concatenate(cross, axis=0)
+            a = np.concatenate([aa, cross[:, 0]])
+            b = np.concatenate([bb, cross[:, 1]])
+        else:
+            a, b = aa, bb
+    if len(a) == 0:
         empty = np.zeros((0, 2), np.int64)
         return (0, 0, empty) if return_pairs else (0, 0)
-    starts = np.cumsum(cnt) - cnt
-    ii = np.repeat(np.arange(n), cnt)
-    jj = ii + 1 + (np.arange(total) - np.repeat(starts, cnt))
-    a, b = order[ii], order[jj]
-    # Pairs without a moved face cannot be caused by this run. Filter them before the y-box and SAT
-    # checks so only relevant candidates reach the later stages.
-    if mv is not None:
-        moved_pair = mv[a] | mv[b]
-        a, b = a[moved_pair], b[moved_pair]
     sel = (box[a, 1, 1] > box[b, 0, 1]) & (box[b, 1, 1] > box[a, 0, 1])
     a, b = a[sel], b[sel]
     same = lab[a] == lab[b]
@@ -1338,7 +1486,7 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
 
 
 def untangle_overlaps(tl, u, movable, lab=None, max_rounds=6,
-                     moved_faces=None, initial=None):
+                     moved_faces=None, initial=None, overlap_cache=None):
     """Apply small, flip-safe separating-axis corrections to detected face overlaps.
 
     Only vertices marked movable receive translation. A correction is retained only if the
@@ -1351,7 +1499,8 @@ def untangle_overlaps(tl, u, movable, lab=None, max_rounds=6,
         moved_faces = np.any(movable[tl], axis=1)
     if initial is None:
         within, across, pairs = overlapping_pairs(
-            tl, out, lab, moved_faces, return_pairs=True)
+            tl, out, lab, moved_faces, return_pairs=True,
+            overlap_cache=overlap_cache)
     else:
         within, across, pairs = initial
     initial_count = within + across
@@ -1436,7 +1585,8 @@ def untangle_overlaps(tl, u, movable, lab=None, max_rounds=6,
             if np.any(area[live_area] * start_area[live_area] <= 0.0):
                 continue
             next_within, next_across, next_pairs = overlapping_pairs(
-                tl, candidate, lab, moved_faces, return_pairs=True)
+                tl, candidate, lab, moved_faces, return_pairs=True,
+                overlap_cache=overlap_cache)
             next_tri = candidate[tl]
             next_edge = np.stack([next_tri[:, 1] - next_tri[:, 0],
                                   next_tri[:, 2] - next_tri[:, 1],
@@ -1460,6 +1610,9 @@ def untangle_overlaps(tl, u, movable, lab=None, max_rounds=6,
                 accepted = True
                 break
         if not accepted:
+            # A rejected trial refreshed only the moved entries with its temporary coordinates;
+            # restore the cache to the last accepted state before leaving this round.
+            _refresh_overlap_cache(overlap_cache, tl, out, lab, moved_faces)
             break
 
     return out, {"before": initial_count, "after": final_within + final_across,

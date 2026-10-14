@@ -93,9 +93,8 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         tuv = uvs[lt]
         read_ms = (time.perf_counter() - t0) * 1000.0
 
-        inv = core.uvvert_ids(tri, tuv)
+        inv, point_isl = core.cached_uv_topology(tri, tuv)
         U = int(inv.max()) + 1
-        point_isl = core.islands(inv, U)
         isl = point_isl[inv[:, 0]]
 
         sync = bool(context.tool_settings.use_uv_select_sync)
@@ -149,12 +148,14 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         reduced_islands = 0
         reduced_faces = 0
         reduced_points = 0
+        local_faces_total = 0
+        local_points_total = 0
+        selected_points_total = 0
+        halo_points_total = 0
+        local_rings = 0
         reinitialized_islands = 0
         capped_holes = 0
-        # which islands the loop actually wrote back: the overlap count is charged against these
-        # faces only, so an island that was already stamped over a neighbour before the button was
-        # pressed is not reported as this button's work
-        moved_labs = []
+        geom_p, geom_a3, geom_metric_prep = core.cached_uv_geometry(co, tri)
         solve_t0 = time.perf_counter()
         for lab in labs:
             f = np.flatnonzero(isl == lab)
@@ -196,7 +197,8 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                 stuck += 1
                 continue
 
-            pf, a3 = core.uv3d(co, tri[f])
+            pf = geom_p[f]
+            a3 = geom_a3[f]
             solve_p = pf
             solve_tl = tl
             solve_uv = pos[ids]
@@ -222,7 +224,7 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                     total_a3_full = float(a3.sum())
                     density_target_full = (0.5 * float(np.abs(q_full[valid_full]).sum()) /
                                            total_a3_full if total_a3_full > 1e-30 else 0.0)
-                    full_boundary_edges, full_boundary_lengths = core.boundary_geometry(pf, tl)
+                    full_boundary_edges, full_boundary_lengths = core.cached_boundary_geometry(pf, tl)
                     if len(full_boundary_edges):
                         keep_boundary = np.all(local_remap[full_boundary_edges] >= 0, axis=1)
                         boundary_edges = local_remap[full_boundary_edges[keep_boundary]]
@@ -249,6 +251,17 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                     reduced_islands += 1
                     reduced_faces += int(active_face.sum())
                     reduced_points += len(local_ids)
+                    local_faces_total += int(active_face.sum())
+                    local_points_total += len(local_ids)
+                    selected_points_total += int(selected_in_island.sum())
+                    halo_points_total += int((~selected_in_island[local_ids]).sum())
+                    local_rings = max(local_rings, 1)
+                else:
+                    local_faces_total += int(len(f))
+                    local_points_total += int(len(ids))
+                    selected_points_total += int(selected_in_island.sum())
+                    halo_points_total += int((~selected_in_island).sum())
+                    local_rings = max(local_rings, 1)
             newuv, st = core.relax_solve(
                 solve_p, solve_tl, solve_uv, solve_pin, maxit=self.steps,
                 density_weight=self.density_weight,
@@ -296,7 +309,6 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             else:
                 pos[ids] = newuv
                 movable_uv[ids[free]] = True
-            moved_labs.append(lab)
             points += int(free.sum())
             relaxed += 1
             took = max(took, st["pass"])
@@ -334,12 +346,17 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         solver_profile["misc_ms"] = max(
             0.0, solve_ms - sum(solver_profile.values()))
         overlap_fix_t0 = time.perf_counter()
-        moved_faces = np.isin(isl, moved_labs)
+        # Only faces touching UV points that actually moved enter the incremental overlap query.
+        # The untouched faces remain in the cached stationary index, even when they belong to the
+        # same island as a partial selection.
+        moved_faces = np.any(movable_uv[inv], axis=1)
+        overlap_cache = {}
         overlap_initial = core.overlapping_pairs(
-            inv, pos, isl, moved=moved_faces, return_pairs=True)
+            inv, pos, isl, moved=moved_faces, return_pairs=True,
+            overlap_cache=overlap_cache)
         pos, overlap_fix = core.untangle_overlaps(
             inv, pos, movable_uv, isl, moved_faces=moved_faces,
-            initial=overlap_initial)
+            initial=overlap_initial, overlap_cache=overlap_cache)
         overlap_fix_ms = (time.perf_counter() - overlap_fix_t0) * 1000.0
         write_t0 = time.perf_counter()
         new_loop_uv = np.empty_like(uvs)
@@ -349,17 +366,19 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         write_ms = (time.perf_counter() - write_t0) * 1000.0
 
         post_t0 = time.perf_counter()
-        p, a3 = core.uv3d(co, tri)
         metric_t0 = time.perf_counter()
-        metric_prep = core.face_metric_prep(p)
-        shape0, k0 = core.face_metric_uv(metric_prep, tuv)
-        shape1, k1 = core.face_metric_uv(metric_prep, new_loop_uv[lt])
-        density0 = _density_stats(k0[scope], a3[scope])
-        density1 = _density_stats(k1[scope], a3[scope])
-        was = float((k0[scope] * a3[scope]).sum())
-        now = float((k1[scope] * a3[scope]).sum())
-        turn0 = _inside_out(core.signed_uv_area(tuv)[scope])
-        turn1 = _inside_out(core.signed_uv_area(new_loop_uv[lt])[scope])
+        metric_prep = geom_metric_prep[scope]
+        scope_tuv0 = tuv[scope]
+        scope_tuv1 = new_loop_uv[lt][scope]
+        scope_a3 = geom_a3[scope]
+        shape0, k0 = core.face_metric_uv(metric_prep, scope_tuv0)
+        shape1, k1 = core.face_metric_uv(metric_prep, scope_tuv1)
+        density0 = _density_stats(k0, scope_a3)
+        density1 = _density_stats(k1, scope_a3)
+        was = float((k0 * scope_a3).sum())
+        now = float((k1 * scope_a3).sum())
+        turn0 = _inside_out(core.signed_uv_area(scope_tuv0))
+        turn1 = _inside_out(core.signed_uv_area(scope_tuv1))
         metric_ms = (time.perf_counter() - metric_t0) * 1000.0
         # the energy asks each face to be a good similarity of itself and is content with two of
         # them sharing one patch of the map, so evenness and zero folds do not add up to an
@@ -400,7 +419,8 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             "selected_faces=%d islands=%d relaxed_islands=%d reduced_islands=%d "
             "reduced_faces=%d reduced_points=%d points=%d solves=%d "
             "cg_passes=%d overlap_fix=%d->%d/%d "
-            "selection_source=%s steps=%d density=%.3f reinitialized=%d capped_holes=%d" %
+            "selection_source=%s steps=%d density=%.3f reinitialized=%d capped_holes=%d "
+            "local_faces=%d local_points=%d selected_points=%d halo_points=%d halo_rings=%d" %
             (context.active_object.name, ms, read_ms, setup_ms, solve_ms, write_ms, post_ms,
              metric_ms, overlap_ms,
              solver_profile["model_ms"], solver_profile["preconditioner_ms"],
@@ -410,7 +430,9 @@ class UVRELAX_OT_relax(bpy.types.Operator):
              reduced_islands, reduced_faces, reduced_points, points, solves, took,
              overlap_fix["before"], overlap_fix["after"], overlap_fix["rounds"],
              selection_source, int(self.steps), float(self.density_weight),
-             reinitialized_islands, capped_holes))
+             reinitialized_islands, capped_holes,
+             local_faces_total, local_points_total, selected_points_total,
+             halo_points_total, local_rings))
         self.report({"WARNING" if (declined or stuck or ran_out or within or across) else "INFO"},
                     "%d UV points on %d island(s) relaxed in %.0f ms | stretch median %.3f "
                     "-> %.3f, worst 1%% %.2f -> %.2f | density CV %.3f -> %.3f, "
@@ -418,9 +440,9 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                     "relaxed UV area %+.1f%% | %d face(s) inside out, was %d | "
                     "%d solve(s), %d refinement(s)%s"
                     % (points, relaxed, ms,
-                       float(np.median(shape0[scope])), float(np.median(shape1[scope])),
-                       float(np.percentile(shape0[scope], 99)),
-                       float(np.percentile(shape1[scope], 99)),
+                       float(np.median(shape0)), float(np.median(shape1)),
+                       float(np.percentile(shape0, 99)),
+                       float(np.percentile(shape1, 99)),
                        density0[0], density1[0], density0[1], density1[1],
                        density0[2], density1[2],
                        100.0 * (now / was - 1.0), turn1, turn0, solves, took, tail))
