@@ -149,6 +149,8 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         reduced_islands = 0
         reduced_faces = 0
         reduced_points = 0
+        reinitialized_islands = 0
+        capped_holes = 0
         # which islands the loop actually wrote back: the overlap count is charged against these
         # faces only, so an island that was already stamped over a neighbour before the button was
         # pressed is not reported as this button's work
@@ -250,9 +252,17 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             newuv, st = core.relax_solve(
                 solve_p, solve_tl, solve_uv, solve_pin, maxit=self.steps,
                 density_weight=self.density_weight,
-                boundary_weight=None, **solve_kwargs)
+                boundary_weight=None,
+                # A complete island can be safely re-charted from its 3D geometry.  A partial
+                # selection must keep its current UV as the fixed-boundary problem's initial state.
+                reinitialize=not local_mode,
+                energy_mode=("symmetric_dirichlet" if not local_mode else "conformal"),
+                cap_holes=not local_mode,
+                **solve_kwargs)
             for key in solver_profile:
                 solver_profile[key] += st.get(key, 0.0)
+            reinitialized_islands += int(st.get("reinitialized", False))
+            capped_holes += int(st.get("capped_holes", 0))
             if st["pass"] == 0:
                 # an island whose every point is held by a face left out is a different
                 # answer from one that has settled, and saying the wrong one sends him
@@ -390,7 +400,7 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             "selected_faces=%d islands=%d relaxed_islands=%d reduced_islands=%d "
             "reduced_faces=%d reduced_points=%d points=%d solves=%d "
             "cg_passes=%d overlap_fix=%d->%d/%d "
-            "selection_source=%s steps=%d density=%.3f" %
+            "selection_source=%s steps=%d density=%.3f reinitialized=%d capped_holes=%d" %
             (context.active_object.name, ms, read_ms, setup_ms, solve_ms, write_ms, post_ms,
              metric_ms, overlap_ms,
              solver_profile["model_ms"], solver_profile["preconditioner_ms"],
@@ -399,8 +409,8 @@ class UVRELAX_OT_relax(bpy.types.Operator):
              selection["verts"], selection["edges"], selection["faces"], len(labs), relaxed,
              reduced_islands, reduced_faces, reduced_points, points, solves, took,
              overlap_fix["before"], overlap_fix["after"], overlap_fix["rounds"],
-             selection_source,
-             int(self.steps), float(self.density_weight)))
+             selection_source, int(self.steps), float(self.density_weight),
+             reinitialized_islands, capped_holes))
         self.report({"WARNING" if (declined or stuck or ran_out or within or across) else "INFO"},
                     "%d UV points on %d island(s) relaxed in %.0f ms | stretch median %.3f "
                     "-> %.3f, worst 1%% %.2f -> %.2f | density CV %.3f -> %.3f, "

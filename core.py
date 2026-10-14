@@ -154,6 +154,242 @@ def signed_uv_area(t):
         - (t[:, 1, 1] - t[:, 0, 1]) * (t[:, 2, 0] - t[:, 0, 0])
 
 
+def _boundary_loops(tl, p):
+    """Return all ordered boundary loops and their 3D edge lengths.
+
+    UV islands normally have one loop.  Choosing the longest connected loop keeps holes from
+    becoming the outer circle when a mesh contains them, while the empty result lets callers fall
+    back to a projection for closed or non-manifold input.
+    """
+    edges = np.concatenate([tl[:, [0, 1]], tl[:, [1, 2]], tl[:, [2, 0]]], axis=0)
+    edges = np.sort(edges, axis=1)
+    _, first, count = np.unique(edges, axis=0, return_index=True, return_counts=True)
+    bedges = edges[first[count == 1]]
+    if len(bedges) < 3:
+        return []
+
+    adjacency = {}
+    edge_at = {}
+    for i, (a, b) in enumerate(bedges.tolist()):
+        adjacency.setdefault(a, []).append(b)
+        adjacency.setdefault(b, []).append(a)
+        edge_at.setdefault(a, []).append(i)
+        edge_at.setdefault(b, []).append(i)
+    unseen = set(range(len(bedges)))
+    loops = []
+    while unseen:
+        seed = unseen.pop()
+        component = [seed]
+        stack = [seed]
+        while stack:
+            i = stack.pop()
+            a, b = bedges[i]
+            for vertex in (int(a), int(b)):
+                for j in edge_at[vertex]:
+                    if j in unseen:
+                        unseen.remove(j)
+                        component.append(j)
+                        stack.append(j)
+        comp_edges = bedges[component]
+        degree = {}
+        for a, b in comp_edges.tolist():
+            degree[a] = degree.get(a, 0) + 1
+            degree[b] = degree.get(b, 0) + 1
+        if len(component) < 3 or any(v != 2 for v in degree.values()):
+            continue
+        start = int(comp_edges[0, 0])
+        ordered = [start]
+        previous = -1
+        current = start
+        while True:
+            nxt = [v for v in adjacency[current] if v != previous]
+            if not nxt:
+                break
+            candidate = int(nxt[0])
+            if candidate == start:
+                break
+            ordered.append(candidate)
+            previous, current = current, candidate
+            if len(ordered) > len(component):
+                break
+        if len(ordered) == len(component):
+            xyz = np.zeros((len(tl), 3), dtype=float)
+            xyz[tl.ravel()] = p.reshape(-1, 3)
+            length = np.linalg.norm(xyz[np.roll(ordered, -1)] - xyz[ordered], axis=1)
+            loops.append((float(length.sum()), np.asarray(ordered, np.int64), length))
+    return loops
+
+
+def _boundary_loop(tl, p):
+    """Return the longest ordered boundary loop of a triangulated disk.
+
+    UV islands normally have one loop.  Choosing the longest connected loop keeps holes from
+    becoming the outer circle when a mesh contains them, while the empty result lets callers fall
+    back to a projection for closed or non-manifold input.
+    """
+    loops = _boundary_loops(tl, p)
+    if not loops:
+        return np.zeros(0, np.int64), np.zeros(0, float)
+    _, loop, lengths = max(loops, key=lambda item: item[0])
+    return loop, lengths
+
+
+def _cap_holes(p, tl, uv0):
+    """Add temporary 3D triangle fans that make each inner boundary part of the solve.
+
+    The extra center vertices and faces are solver-only.  The caller removes the virtual vertices
+    from the returned UV, so the mesh topology and the user's UV selection never change.
+    """
+    loops = _boundary_loops(tl, p)
+    if len(loops) <= 1:
+        return p, tl, uv0, 0
+    outer = max(loops, key=lambda item: item[0])[1]
+    outer_set = set(outer.tolist())
+    holes = [item[1] for item in loops if not set(item[1].tolist()).issubset(outer_set)]
+    if not holes:
+        return p, tl, uv0, 0
+
+    xyz = np.zeros((len(uv0), 3), dtype=float)
+    xyz[tl.ravel()] = p.reshape(-1, 3)
+    q = signed_uv_area(uv0[tl])
+    nz = q[np.abs(q) > 1e-14 * max(float(np.abs(q).max()), 1e-30)]
+    majority = 1.0 if len(nz) == 0 or int((nz > 0).sum()) >= int((nz < 0).sum()) else -1.0
+
+    add_p = []
+    add_tl = []
+    add_uv = []
+    for loop in holes:
+        center_xyz = xyz[loop].mean(0)
+        hole_uv = uv0[loop]
+        hole_next = np.roll(hole_uv, -1, axis=0)
+        cross = hole_uv[:, 0] * hole_next[:, 1] - hole_next[:, 0] * hole_uv[:, 1]
+        area2 = float(cross.sum())
+        if abs(area2) > 1e-20:
+            center_uv = ((hole_uv + hole_next) * cross[:, None]).sum(0) / (3.0 * area2)
+        else:
+            center_uv = hole_uv.mean(0)
+        if not np.isfinite(center_uv).all():
+            center_uv = hole_uv.mean(0)
+        center_id = len(uv0) + len(add_uv)
+        add_uv.append(center_uv)
+        for a, b in zip(loop, np.roll(loop, -1)):
+            a, b = int(a), int(b)
+            area = ((uv0[b, 0] - uv0[a, 0]) * (center_uv[1] - uv0[a, 1]) -
+                    (uv0[b, 1] - uv0[a, 1]) * (center_uv[0] - uv0[a, 0]))
+            if area * majority < 0.0:
+                a, b = b, a
+            add_tl.append((center_id, a, b))
+            add_p.append((center_xyz, xyz[a], xyz[b]))
+    if not add_tl:
+        return p, tl, uv0, 0
+    return (np.concatenate([p, np.asarray(add_p, dtype=float)], axis=0),
+            np.concatenate([tl, np.asarray(add_tl, dtype=np.int64)], axis=0),
+            np.concatenate([uv0, np.asarray(add_uv, dtype=float)], axis=0),
+            len(add_uv))
+
+
+def reinitialize_uv(p, tl, uv0):
+    """Build a stable disk parameterization from 3D geometry for a badly damaged full island.
+
+    The boundary is fixed to a circle by 3D edge length and the interior is solved with a positive
+    graph Laplacian.  The result is then Procrustes-aligned and area-matched to the incoming UV so
+    a repair does not unexpectedly jump across the image editor.
+    """
+    V = len(uv0)
+    loop, lengths = _boundary_loop(tl, p)
+    if len(loop) < 3:
+        # A closed island has no boundary to anchor a disk map.  PCA still gives a deterministic
+        # starting chart, and the subsequent ARAP solve can improve it without using old UV data.
+        xyz = np.zeros((V, 3), dtype=float)
+        xyz[tl.ravel()] = p.reshape(-1, 3)
+        xyz -= xyz.mean(0)
+        _, _, vh = np.linalg.svd(xyz, full_matrices=False)
+        out = xyz @ vh[:2].T
+        if np.linalg.norm(out.max(0) - out.min(0)) <= 1e-20:
+            return uv0.copy()
+    else:
+        xyz = np.zeros((V, 3), dtype=float)
+        xyz[tl.ravel()] = p.reshape(-1, 3)
+        out = np.zeros((V, 2), dtype=float)
+        perimeter = max(float(lengths.sum()), 1e-30)
+        angle = 2.0 * np.pi * np.cumsum(np.r_[0.0, lengths[:-1]]) / perimeter
+        # Keep the majority orientation of the existing chart when it is meaningful.
+        q = signed_uv_area(uv0[tl])
+        if int((q < 0.0).sum()) > int((q > 0.0).sum()):
+            angle = -angle
+        out[loop] = np.stack([np.cos(angle), np.sin(angle)], axis=1)
+        boundary = np.zeros(V, bool)
+        boundary[loop] = True
+
+        edges = np.concatenate([tl[:, [0, 1]], tl[:, [1, 2]], tl[:, [2, 0]]], axis=0)
+        edges = np.sort(edges, axis=1)
+        edges = np.unique(edges, axis=0)
+        edge_xyz = xyz[edges[:, 1]] - xyz[edges[:, 0]]
+        ew = 1.0 / np.maximum(np.linalg.norm(edge_xyz, axis=1), 1e-12)
+        diag = np.bincount(edges.ravel(), weights=np.repeat(ew, 2), minlength=V)
+        interior = ~boundary
+        interior_ids = np.flatnonzero(interior)
+        if len(interior_ids):
+            local = -np.ones(V, np.int64)
+            local[interior_ids] = np.arange(len(interior_ids))
+            ii = interior_ids
+            rhs = np.zeros((len(ii), 2), dtype=float)
+            ea, eb = edges[:, 0], edges[:, 1]
+            ab = interior[ea] & boundary[eb]
+            ba = interior[eb] & boundary[ea]
+            np.add.at(rhs, local[ea[ab]], ew[ab, None] * out[eb[ab]])
+            np.add.at(rhs, local[eb[ba]], ew[ba, None] * out[ea[ba]])
+
+            both = interior[ea] & interior[eb]
+            ia, ib, iw = local[ea[both]], local[eb[both]], ew[both]
+
+            def mat(x):
+                y = diag[ii] * x
+                np.add.at(y, ia, -iw * x[ib])
+                np.add.at(y, ib, -iw * x[ia])
+                return y
+
+            x = np.zeros_like(rhs)
+            for axis in (0, 1):
+                bvec = rhs[:, axis]
+                r = bvec - mat(x[:, axis])
+                z = r / np.maximum(diag[ii], 1e-30)
+                d = z.copy()
+                rz = float(r @ z)
+                for _ in range(min(1200, max(80, 4 * len(ii)))):
+                    hd = mat(d)
+                    den = float(d @ hd)
+                    if den <= 1e-30:
+                        break
+                    alpha = rz / den
+                    x[:, axis] += alpha * d
+                    r -= alpha * hd
+                    if float(np.linalg.norm(r)) <= 1e-7 * max(float(np.linalg.norm(bvec)), 1e-30):
+                        break
+                    z = r / np.maximum(diag[ii], 1e-30)
+                    rz_new = float(r @ z)
+                    d = z + (rz_new / max(rz, 1e-30)) * d
+                    rz = rz_new
+            out[ii] = x
+
+    source_center = out.mean(0)
+    target_center = uv0.mean(0)
+    src = out - source_center
+    dst = uv0 - target_center
+    h = src.T @ dst
+    uu, _, vv = np.linalg.svd(h)
+    rot = uu @ vv
+    if np.linalg.det(rot) < 0.0:
+        uu[:, -1] *= -1.0
+        rot = uu @ vv
+    out = src @ rot
+    old_area = float(np.abs(signed_uv_area(uv0[tl])).sum())
+    new_area = float(np.abs(signed_uv_area(out[tl])).sum())
+    if new_area > 1e-30:
+        out *= np.sqrt(max(old_area, 1e-30) / new_area)
+    return out + target_center
+
+
 # how far a model triangle's angles are allowed to go before its stiffness is capped: a face
 # squashed flat would otherwise ask for an infinite weight, and a face thrown out entirely asks for
 # nothing at all, which leaves it dead material the rest of the island flows around.  RizomUV
@@ -222,7 +458,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 area2_override=None, spread_override=None,
                 majority_orientation=None, boundary_edges_override=None,
                 boundary_3d_length_override=None, boundary_count_override=None,
-                scale_center_override=None):
+                scale_center_override=None, reinitialize=False,
+                energy_mode="conformal", cap_holes=False):
     """Bring one island to the evenest shape its boundary allows -- by solving for it.
 
     The conformal part of the energy this relaxes is a quadratic form in the UV coordinates:
@@ -292,14 +529,46 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
     inside out to begin with, stats["fold_left"] how many still are in what is handed back, and
     stats["ask"] which of the two questions won: "open" asked for one orientation and worked to turn
     the folds back, "even" left them mirrored and evened them out instead."""
-    V = len(uv0)
+    output_V = len(uv0)
+    V = output_V
+    uv0 = np.asarray(uv0, dtype=float).copy()
+    pin = np.asarray(pin, dtype=bool).copy()
+    virtual_holes = 0
+    real_face_count = len(tl)
+    if cap_holes and not pin.any():
+        p, tl, uv0, virtual_holes = _cap_holes(p, tl, uv0)
+        if virtual_holes:
+            pin = np.concatenate([pin, np.zeros(virtual_holes, dtype=bool)])
+            V = len(uv0)
+    reinitialized = False
+    if reinitialize and not np.asarray(pin, dtype=bool).any() and len(tl):
+        # Rebuild only when the incoming chart is beyond what a local Newton/ARAP step can
+        # sensibly repair.  Ordinary uneven UVs keep their authored layout and therefore their
+        # useful placement in the editor.
+        q_in = signed_uv_area(uv0[tl])
+        nz = q_in[np.abs(q_in) > 1e-14 * max(float(np.abs(q_in).max()), 1e-30)]
+        if len(nz):
+            majority = 1.0 if int((nz > 0).sum()) >= int((nz < 0).sum()) else -1.0
+            fold_ratio = float((nz * majority < 0.0).sum()) / len(nz)
+            metric_shape, metric_det = face_metric(p, uv0[tl])
+            severe = (fold_ratio > 0.08 or
+                      float(np.percentile(metric_shape, 99)) > 25.0 or
+                      float(np.percentile(metric_shape, 50)) > 4.0 or
+                      float(np.std(np.log(np.maximum(metric_det, 1e-30)))) > 1.4)
+            if severe:
+                candidate = reinitialize_uv(p, tl, uv0)
+                if np.isfinite(candidate).all():
+                    uv0 = candidate
+                    reinitialized = True
     profile = {"model_ms": 0.0, "preconditioner_ms": 0.0, "cg_ms": 0.0,
                "line_search_ms": 0.0}
     q0 = signed_uv_area(uv0[tl])
     sg = np.sign(q0)
-    maj = (1.0 if (sg > 0).sum() >= (sg < 0).sum() else -1.0
+    real_faces = np.arange(len(tl)) < real_face_count
+    sg_real = sg[real_faces]
+    maj = (1.0 if (sg_real > 0).sum() >= (sg_real < 0).sum() else -1.0
            ) if majority_orientation is None else float(majority_orientation)
-    wrong = (sg != maj) & (sg != 0.0)
+    wrong = real_faces & (sg != maj) & (sg != 0.0)
     fold = bool(wrong.any())
 
     e1 = p[:, 1] - p[:, 0]
@@ -333,6 +602,21 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
               if spread_override is None else float(spread_override))
 
     prepped = face_metric_prep(p)
+    symmetric_dirichlet = str(energy_mode).lower() in {
+        "symmetric_dirichlet", "sd", "arap", "global_local"}
+
+    def sd_scale(u):
+        """IRLS weight for the inverse-stretch side of symmetric Dirichlet energy."""
+        if not symmetric_dirichlet or density_target <= 1e-30:
+            return np.ones(len(a3), dtype=float)
+        shape_now, det = face_metric_uv(prepped, u[tl])
+        ratio = np.clip(det / density_target, 1e-4, 1e4)
+        anisotropy = np.clip(0.5 * (shape_now + 1.0 / np.maximum(shape_now, 1e-12)), 1.0, 64.0)
+        # The square root keeps the reweighted quadratic well-conditioned while still making
+        # collapsed, over-expanded, and highly anisotropic triangles expensive in the next global
+        # step.  The conformal residual supplies the directional part; this factor supplies the
+        # inverse-stretch side of symmetric Dirichlet.
+        return np.sqrt(np.clip(0.5 * (ratio + 1.0 / ratio) * anisotropy, 1.0, 64.0))
 
     # Recover the outline from topology and measure it in 3D.  The target UV length uses the
     # island's starting average density, so a bad starting outline can move freely without making
@@ -572,10 +856,14 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             e += float((boundary_weights * boundary_error(u) ** 2).sum())
         return e
 
+    def objective(A, w, signs, u, dens):
+        """Evaluate the current IRLS objective, including its symmetric-Dirichlet weights."""
+        return energy(A, w * sd_scale(u), signs, u, dens)
+
     def inverted(u):
         """Faces of the island lying the way round the majority is not, in the state u."""
         s = np.sign(signed_uv_area(u[tl]))
-        return (s != maj) & (s != 0.0)
+        return real_faces & (s != maj) & (s != 0.0)
 
     def inside_out(u):
         return int(inverted(u).sum())
@@ -611,11 +899,11 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
 
     stats = {"free": int((~held).sum()), "pass": 0, "solve": 0, "gain": 0.0, "why": "relaxed",
              "fold": int(wrong.sum()), "ask": None, "converged": True, "fold_left": 0,
-             **profile}
+             "reinitialized": reinitialized, "capped_holes": int(virtual_holes), **profile}
     if held.all():
         stats["why"] = "nothing to move"
         stats.update(profile)
-        return uv0.copy(), stats
+        return uv0[:output_V].copy(), stats
     flip0 = inside_out(uv0)
 
     def restore(v):
@@ -775,16 +1063,45 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         def keep(cand):
             # the objective the solves are actually minimising, folds first: `shape` is blind to
             # density, and keying on it threw every density state the island reached away
-            key = (inside_out(cand), energy(A, w, signs, cand, True))
+            key = (inside_out(cand), objective(A, w, signs, cand, True))
             if best[0] is None or key < best[0][0]:
                 best[0] = (key, cand, count[0], count[1], count[2])
             return key
 
         def step(clamp_at, base_at, dens):
-            cand, iters, hit, _ = solve(A, w, signs, clamp_at, base_at, dens)
-            note(iters, hit)
-            keep(cand)
-            return cand
+            # Symmetric Dirichlet is handled as a short global/local IRLS loop.  The local step
+            # raises the weight of collapsed or over-expanded faces, then the global CG solve moves
+            # the UVs under that updated metric.  The loop is deliberately short because density
+            # polishing below already re-expands the model at the accepted state.
+            current = base_at
+            loops = 3 if symmetric_dirichlet else 1
+            for _ in range(loops):
+                local_w = w * sd_scale(current)
+                cand, iters, hit, direction = solve(
+                    A, local_w, signs, clamp_at, current, dens)
+                note(iters, hit)
+                if iters == 0:
+                    break
+                search_t0 = time.perf_counter()
+                old_fold = inside_out(current)
+                old_energy = objective(A, w, signs, current, dens)
+                accepted = None
+                for fraction in (1.0, 0.5, 0.25, 0.125, 0.0625):
+                    trial = current + fraction * direction
+                    if loose:
+                        trial = restore(trial)
+                    if (inside_out(trial) <= old_fold and
+                            objective(A, w, signs, trial, dens) <= old_energy + 1e-12 * max(old_energy, 1.0)):
+                        accepted = trial
+                        break
+                profile["line_search_ms"] += (time.perf_counter() - search_t0) * 1000.0
+                if accepted is None:
+                    break
+                current = accepted
+                keep(current)
+                if float(np.abs(fraction * direction).max()) <= 1e-7 * spread:
+                    break
+            return current
 
         def polish(base_at, clamp_at):
             """Even the packing out, one Gauss-Newton round at a time about where the last round
@@ -803,15 +1120,16 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             the linearization reached, and a round costs one conjugate-gradient solve."""
             base = base_at
             for _ in range(density_refine):
-                model = system(A, w, signs, base, True)
+                local_w = w * sd_scale(base)
+                model = system(A, local_w, signs, base, True)
                 value = model[3]
                 cand, iters, hit, x = solve(
-                    A, w, signs, clamp_at, base, True, tol=density_tol, model=model)
+                    A, local_w, signs, clamp_at, base, True, tol=density_tol, model=model)
                 note(iters, hit)
                 if iters == 0:
                     break
                 line_search_t0 = time.perf_counter()
-                e_last = energy(A, w, signs, base, True)
+                e_last = objective(A, w, signs, base, True)
                 # m(t) = e_last + a t + b t^2 along the ray, read off the model at t = 1/2 and t = 1
                 slope = 4.0 * (value(base + 0.5 * x) - e_last) - (value(cand) - e_last)
                 fold_last = inside_out(base)
@@ -821,7 +1139,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                     if loose:
                         u = restore(u)
                     if (inside_out(u) <= fold_last
-                            and energy(A, w, signs, u, True) <= e_last + 0.1 * t * slope):
+                            and objective(A, w, signs, u, True) <= e_last + 0.1 * t * slope):
                         moved = u - base
                         base = u
                         keep(base)
@@ -859,7 +1177,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             if use_d:
                 base = polish(base, np.zeros(V, bool))
         return best[0][1], best[0][2], best[0][3], best[0][4], \
-            energy(A, w, signs, uv0, True) - energy(A, w, signs, best[0][1], True)
+            objective(A, w, signs, uv0, True) - objective(A, w, signs, best[0][1], True)
 
     at, used, nsolve, out, gain = run(maj if fold else None, fold_rounds, True)
 
@@ -888,7 +1206,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         stats["ask"] = "open"
         stats["why"] = "left alone" if fold else "already even"
         stats.update(profile)
-        return uv0.copy(), stats
+        return uv0[:output_V].copy(), stats
     _, stats["ask"], at, stats["pass"], stats["solve"], out, stats["gain"] = win
     if loose:
         # a no-op for anything the density rounds touched -- they keep the area themselves -- but
@@ -897,7 +1215,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
     stats["converged"] = not out
     stats["fold_left"] = inside_out(at)
     stats.update(profile)
-    return at, stats
+    return at[:output_V].copy(), stats
 
 
 def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
