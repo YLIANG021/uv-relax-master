@@ -93,18 +93,17 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         tuv = uvs[lt]
         read_ms = (time.perf_counter() - t0) * 1000.0
 
-        inv, point_isl = core.cached_uv_topology(tri, tuv)
+        inv, point_isl, topology = core.cached_uv_topology(tri, tuv)
         U = int(inv.max()) + 1
-        isl = point_isl[inv[:, 0]]
+        isl = topology["face_isl"]
 
         sync = bool(context.tool_settings.use_uv_select_sync)
         sync_uv_valid = bool(sync and getattr(bm, "uv_select_sync_valid", False))
         selection_source = ("UV_CORNERS" if sync_uv_valid else "MESH") if sync else "UV"
         selection = bridge.selection_counts(bm, sync)
         corner_selected = bridge.selected_corners(bm, lt, sync, context.tool_settings)
-        selected_uv = np.zeros(U, dtype=bool)
-        np.logical_or.at(selected_uv, inv.ravel(), corner_selected.ravel())
-        selection_present = bool(selected_uv.any())
+        selected_point_ids = np.unique(inv.ravel()[corner_selected.ravel()])
+        selection_present = bool(len(selected_point_ids))
         if not selection_present:
             _console_log(
                 "CANCEL object=%s mode=%s selected_verts=%d selected_edges=%d "
@@ -114,15 +113,15 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                  (time.perf_counter() - t0) * 1000.0))
             self.report({"WARNING"}, "Nothing selected in the UV editor")
             return {"CANCELLED"}
-        labs = np.unique(point_isl[selected_uv])
-        scope = np.any(selected_uv[inv], axis=1)
+        labs = np.unique(point_isl[selected_point_ids])
+        scope_face_ids = core.incident_faces(topology, selected_point_ids)
 
         _console_log(
             "START object=%s mode=%s selected_verts=%d selected_edges=%d selected_faces=%d "
             "scope_faces=%d islands=%d selection_source=%s steps=%d density=%.3f" %
             (context.active_object.name, "SYNC" if sync else "UV",
              selection["verts"], selection["edges"], selection["faces"],
-             int(scope.sum()), len(labs),
+             len(scope_face_ids), len(labs),
              selection_source,
              int(self.steps), float(self.density_weight)))
         setup_ms = (time.perf_counter() - t0) * 1000.0 - read_ms
@@ -156,17 +155,25 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         reinitialized_islands = 0
         capped_holes = 0
         geom_p, geom_a3, geom_metric_prep = core.cached_uv_geometry(co, tri)
+        island_refs = core.cached_island_references(
+            co, tri, inv, point_isl, tuv, pos, topology, geom_p, geom_a3)
         solve_t0 = time.perf_counter()
         for lab in labs:
-            f = np.flatnonzero(isl == lab)
-            ids = np.unique(inv[f])
-            remap = -np.ones(U, np.int64)
-            remap[ids] = np.arange(len(ids))
-            tl = remap[inv[f]]
-
-            selected_in_island = selected_uv[ids]
-            partial_island = bool(selected_in_island.any() and not selected_in_island.all())
+            all_ids = core.grouped_indices(topology, int(lab), "point")
+            selected_in_labs = selected_point_ids[point_isl[selected_point_ids] == lab]
+            partial_island = len(selected_in_labs) < len(all_ids)
             local_mode = partial_island
+
+            if local_mode:
+                f = core.incident_faces(topology, selected_in_labs)
+                ids = np.unique(inv[f])
+                tl = np.searchsorted(ids, inv[f])
+                selected_in_island = np.isin(ids, selected_in_labs, assume_unique=True)
+            else:
+                f = core.grouped_indices(topology, int(lab), "face")
+                ids = all_ids
+                tl = np.searchsorted(ids, inv[f])
+                selected_in_island = np.ones(len(ids), dtype=bool)
 
             if local_mode:
                 # Only UV points explicitly selected by the user may move.  All other points are
@@ -197,6 +204,12 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                 stuck += 1
                 continue
 
+            local_faces_total += len(f)
+            local_points_total += len(ids)
+            selected_points_total += len(selected_in_labs)
+            halo_points_total += len(ids) - len(selected_in_labs)
+            local_rings = max(local_rings, int(local_mode))
+
             pf = geom_p[f]
             a3 = geom_a3[f]
             solve_p = pf
@@ -204,64 +217,34 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             solve_uv = pos[ids]
             solve_pin = ~free
             solve_kwargs = {}
-            reduced = False
+            reduced = local_mode
             if local_mode:
-                # Faces made entirely of held points contribute only a constant to the local
-                # objective.  Drop them, while retaining every face that touches a free point and
-                # the original island-wide reference values used by density and boundary terms.
-                active_face = np.any(free[tl], axis=1)
-                if active_face.any() and int(active_face.sum()) < len(f):
-                    local_ids = np.unique(tl[active_face])
-                    local_remap = -np.ones(len(ids), np.int64)
-                    local_remap[local_ids] = np.arange(len(local_ids))
-                    solve_tl = local_remap[tl[active_face]]
-                    solve_p = pf[active_face]
-                    solve_uv = pos[ids][local_ids]
-                    solve_pin = ~free[local_ids]
-
-                    q_full = core.signed_uv_area(pos[ids][tl])
-                    valid_full = a3 > 1e-30
-                    total_a3_full = float(a3.sum())
-                    density_target_full = (0.5 * float(np.abs(q_full[valid_full]).sum()) /
-                                           total_a3_full if total_a3_full > 1e-30 else 0.0)
-                    full_boundary_edges, full_boundary_lengths = core.cached_boundary_geometry(pf, tl)
-                    if len(full_boundary_edges):
-                        keep_boundary = np.all(local_remap[full_boundary_edges] >= 0, axis=1)
-                        boundary_edges = local_remap[full_boundary_edges[keep_boundary]]
-                        boundary_lengths = full_boundary_lengths[keep_boundary]
-                    else:
-                        boundary_edges = np.zeros((0, 2), np.int64)
-                        boundary_lengths = np.zeros(0, dtype=float)
-                    signs_full = np.sign(q_full)
-                    majority_full = (1.0 if (signs_full > 0).sum() >= (signs_full < 0).sum()
-                                     else -1.0)
-                    solve_kwargs = {
-                        "total_a3_override": total_a3_full,
-                        "density_target_override": density_target_full,
-                        "area2_override": float(np.abs(q_full).sum()),
-                        "spread_override": float(np.linalg.norm(
-                            pos[ids].max(0) - pos[ids].min(0)) + 1e-30),
-                        "scale_center_override": pos[ids].mean(0),
-                        "majority_orientation": majority_full,
-                        "boundary_edges_override": boundary_edges,
-                        "boundary_3d_length_override": boundary_lengths,
-                        "boundary_count_override": len(full_boundary_edges),
-                    }
-                    reduced = True
-                    reduced_islands += 1
-                    reduced_faces += int(active_face.sum())
-                    reduced_points += len(local_ids)
-                    local_faces_total += int(active_face.sum())
-                    local_points_total += len(local_ids)
-                    selected_points_total += int(selected_in_island.sum())
-                    halo_points_total += int((~selected_in_island[local_ids]).sum())
-                    local_rings = max(local_rings, 1)
+                boundary_edges_global, boundary_lengths, boundary_count = core.island_boundary(
+                    topology, island_refs, int(lab))
+                if len(boundary_edges_global):
+                    loc = np.searchsorted(ids, boundary_edges_global)
+                    inside = (loc < len(ids)) & (
+                        ids[np.minimum(loc, len(ids) - 1)] == boundary_edges_global)
+                    keep_boundary = np.all(inside, axis=1)
+                    boundary_edges = loc[keep_boundary]
+                    boundary_lengths = boundary_lengths[keep_boundary]
                 else:
-                    local_faces_total += int(len(f))
-                    local_points_total += int(len(ids))
-                    selected_points_total += int(selected_in_island.sum())
-                    halo_points_total += int((~selected_in_island).sum())
-                    local_rings = max(local_rings, 1)
+                    boundary_edges = np.zeros((0, 2), np.int64)
+                    boundary_lengths = np.zeros(0, dtype=float)
+                solve_kwargs = {
+                    "total_a3_override": float(island_refs["total_a3"][lab]),
+                    "density_target_override": float(island_refs["density_target"][lab]),
+                    "area2_override": float(island_refs["area2"][lab]),
+                    "spread_override": float(island_refs["spread"][lab]),
+                    "scale_center_override": island_refs["center"][lab],
+                    "majority_orientation": float(island_refs["orientation"][lab]),
+                    "boundary_edges_override": boundary_edges,
+                    "boundary_3d_length_override": boundary_lengths,
+                    "boundary_count_override": boundary_count,
+                }
+                reduced_islands += 1
+                reduced_faces += len(f)
+                reduced_points += len(ids)
             newuv, st = core.relax_solve(
                 solve_p, solve_tl, solve_uv, solve_pin, maxit=self.steps,
                 density_weight=self.density_weight,
@@ -304,8 +287,8 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                 mirrored += 1
                 mirrored_faces += int(st["fold_left"])
             if reduced:
-                pos[ids[local_ids]] = newuv
-                movable_uv[ids[local_ids[free[local_ids]]]] = True
+                pos[ids] = newuv
+                movable_uv[ids[free]] = True
             else:
                 pos[ids] = newuv
                 movable_uv[ids[free]] = True
@@ -367,10 +350,10 @@ class UVRELAX_OT_relax(bpy.types.Operator):
 
         post_t0 = time.perf_counter()
         metric_t0 = time.perf_counter()
-        metric_prep = geom_metric_prep[scope]
-        scope_tuv0 = tuv[scope]
-        scope_tuv1 = new_loop_uv[lt][scope]
-        scope_a3 = geom_a3[scope]
+        metric_prep = geom_metric_prep[scope_face_ids]
+        scope_tuv0 = tuv[scope_face_ids]
+        scope_tuv1 = new_loop_uv[lt[scope_face_ids]]
+        scope_a3 = geom_a3[scope_face_ids]
         shape0, k0 = core.face_metric_uv(metric_prep, scope_tuv0)
         shape1, k1 = core.face_metric_uv(metric_prep, scope_tuv1)
         density0 = _density_stats(k0, scope_a3)
@@ -413,6 +396,8 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         _console_log(
             "DONE object=%s elapsed_ms=%.1f read_ms=%.1f setup_ms=%.1f solve_ms=%.1f "
             "write_ms=%.1f post_ms=%.1f metric_ms=%.1f overlap_ms=%.1f "
+            "overlap_refresh_ms=%.1f overlap_candidate_ms=%.1f overlap_sat_ms=%.1f "
+            "overlap_candidates=%d overlap_mode=%s "
             "solver_model_ms=%.1f precond_ms=%.1f cg_ms=%.1f density_line_ms=%.1f "
             "solver_misc_ms=%.1f "
             "selected_verts=%d selected_edges=%d "
@@ -422,7 +407,9 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             "selection_source=%s steps=%d density=%.3f reinitialized=%d capped_holes=%d "
             "local_faces=%d local_points=%d selected_points=%d halo_points=%d halo_rings=%d" %
             (context.active_object.name, ms, read_ms, setup_ms, solve_ms, write_ms, post_ms,
-             metric_ms, overlap_ms,
+             metric_ms, overlap_ms, overlap_cache["refresh_ms"],
+             overlap_cache["candidate_ms"], overlap_cache["sat_ms"],
+             int(overlap_cache["candidate_count"]), overlap_cache["candidate_mode"],
              solver_profile["model_ms"], solver_profile["preconditioner_ms"],
              solver_profile["cg_ms"], solver_profile["line_search_ms"],
              solver_profile["misc_ms"],

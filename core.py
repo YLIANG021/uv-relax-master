@@ -1,6 +1,7 @@
 # numpy-only UV math.  No bpy types: every function runs on plain arrays, so the exact
 # same code is testable outside Blender.
 
+import hashlib
 import time
 
 import numpy as np
@@ -11,25 +12,30 @@ import numpy as np
 # reused while still avoiding repeated global numpy work during ordinary UV-only edits.
 _TOPOLOGY_CACHE = {}
 _GEOMETRY_CACHE = {}
-_BOUNDARY_CACHE = {}
+_ISLAND_REFERENCE_CACHE = {}
+_OVERLAP_INDEX_CACHE = {}
 
 
 def _array_digest(array):
     array = np.ascontiguousarray(array)
-    return (array.shape, array.dtype.str, hash(array.tobytes()))
+    digest = hashlib.blake2b(memoryview(array).cast("B"), digest_size=16).digest()
+    return (array.shape, array.dtype.str, digest)
 
 
-def cached_uv_topology(tri, tuv, limit=4):
+def cached_uv_topology(tri, tuv, limit=1):
     """Return UV point ids and island labels, reusing unchanged mesh/UV seam topology."""
     tri = np.asarray(tri)
     tuv = np.asarray(tuv)
     quantized_uv = np.rint(tuv * 1e5).astype(np.int64)
     key = _array_digest(tri)
+    uv_signature = _array_digest(quantized_uv)
     entries = _TOPOLOGY_CACHE.setdefault(key, [])
     corner_uv = quantized_uv.reshape(-1, 2)
     corner_vertex = tri.reshape(-1)
-    for entry in entries:
-        inv, point_isl, point_vertex, first_corner = entry
+    for entry_index, entry in enumerate(entries):
+        inv, point_isl, point_vertex, first_corner, metadata, cached_uv_signature = entry
+        if cached_uv_signature == uv_signature:
+            return inv, point_isl, metadata
         representative_uv = corner_uv[first_corner]
         # A changed value is harmless when every corner belonging to a cached UV point changed
         # together.  This catches a split point without rebuilding the global unique table.
@@ -40,7 +46,9 @@ def cached_uv_topology(tri, tuv, limit=4):
         point_keys = np.concatenate([point_vertex[:, None], representative_uv], axis=1)
         if len(np.unique(point_keys, axis=0)) != len(point_vertex):
             continue
-        return inv, point_isl
+        entries[entry_index] = (inv, point_isl, point_vertex, first_corner,
+                                metadata, uv_signature)
+        return inv, point_isl, metadata
 
     inv = uvvert_ids(tri, tuv)
     U = int(inv.max()) + 1
@@ -52,15 +60,164 @@ def cached_uv_topology(tri, tuv, limit=4):
     first_corner[point_ids] = first
     point_vertex = np.zeros(U, np.int64)
     point_vertex[point_ids] = corner_vertex[first]
-    entries.append((inv, point_isl, point_vertex, first_corner))
+    metadata = _build_uv_topology_metadata(inv, point_isl)
+    entries.append((inv, point_isl, point_vertex, first_corner, metadata, uv_signature))
     while len(entries) > limit:
         entries.pop(0)
-    while len(_TOPOLOGY_CACHE) > limit:
+    while len(_TOPOLOGY_CACHE) > 1:
         _TOPOLOGY_CACHE.pop(next(iter(_TOPOLOGY_CACHE)))
-    return inv, point_isl
+    return inv, point_isl, metadata
 
 
-def cached_uv_geometry(co, tri, limit=4):
+def _group_offsets(labels, count):
+    labels = np.asarray(labels, dtype=np.int64)
+    sizes = np.bincount(labels, minlength=count)
+    offsets = np.empty(count + 1, np.int64)
+    offsets[0] = 0
+    np.cumsum(sizes, out=offsets[1:])
+    return np.argsort(labels, kind="stable"), offsets
+
+
+def _build_uv_topology_metadata(inv, point_isl):
+    """Build reusable island groups, point-to-face adjacency, and island boundary edges."""
+    face_isl = point_isl[inv[:, 0]]
+    island_count = int(point_isl.max()) + 1 if len(point_isl) else 0
+    face_order, face_offsets = _group_offsets(face_isl, island_count)
+    point_order, point_offsets = _group_offsets(point_isl, island_count)
+
+    face_ids = np.repeat(np.arange(len(inv), dtype=np.int64), 3)
+    point_face = np.unique(np.stack([inv.ravel(), face_ids], axis=1), axis=0)
+    incident_order = np.argsort(point_face[:, 0], kind="stable")
+    incident_face = point_face[incident_order, 1]
+    incident_count = np.bincount(point_face[:, 0], minlength=len(point_isl))
+    incident_offsets = np.empty(len(point_isl) + 1, np.int64)
+    incident_offsets[0] = 0
+    np.cumsum(incident_count, out=incident_offsets[1:])
+
+    corner_pairs = ((0, 1), (1, 2), (2, 0))
+    edge_points = np.concatenate([inv[:, list(pair)] for pair in corner_pairs], axis=0)
+    edge_points = np.sort(edge_points, axis=1)
+    edge_labels = np.tile(face_isl, 3)
+    edge_faces = np.tile(np.arange(len(inv), dtype=np.int64), 3)
+    edge_corners = np.concatenate([
+        np.broadcast_to(np.asarray(pair, np.int8), (len(inv), 2))
+        for pair in corner_pairs
+    ], axis=0)
+    edge_keys = np.column_stack([edge_labels, edge_points])
+    unique_edges, first_edge, edge_count = np.unique(
+        edge_keys, axis=0, return_index=True, return_counts=True)
+    boundary = edge_count == 1
+    boundary_labels = unique_edges[boundary, 0]
+    boundary_edges = unique_edges[boundary, 1:]
+    boundary_order, boundary_offsets = _group_offsets(boundary_labels, island_count)
+    boundary_faces = edge_faces[first_edge[boundary]]
+    boundary_corners = edge_corners[first_edge[boundary]]
+    return {
+        "face_isl": face_isl,
+        "face_order": face_order,
+        "face_offsets": face_offsets,
+        "point_order": point_order,
+        "point_offsets": point_offsets,
+        "incident_offsets": incident_offsets,
+        "incident_faces": incident_face,
+        "boundary_order": boundary_order,
+        "boundary_offsets": boundary_offsets,
+        "boundary_edges": boundary_edges,
+        "boundary_isl": boundary_labels,
+        "boundary_faces": boundary_faces,
+        "boundary_corners": boundary_corners,
+        "island_count": island_count,
+    }
+
+
+def grouped_indices(metadata, group, kind="face"):
+    order = metadata[kind + "_order"]
+    offsets = metadata[kind + "_offsets"]
+    return order[offsets[group]:offsets[group + 1]]
+
+
+def incident_faces(metadata, point_ids):
+    point_ids = np.asarray(point_ids, dtype=np.int64)
+    if not len(point_ids):
+        return np.zeros(0, np.int64)
+    offsets = metadata["incident_offsets"]
+    lengths = offsets[point_ids + 1] - offsets[point_ids]
+    total = int(lengths.sum())
+    if total == 0:
+        return np.zeros(0, np.int64)
+    starts = offsets[point_ids]
+    repeat_starts = np.repeat(starts, lengths)
+    within = np.arange(total) - np.repeat(np.cumsum(lengths) - lengths, lengths)
+    return np.unique(metadata["incident_faces"][repeat_starts + within])
+
+
+def cached_island_references(co, tri, inv, point_isl, tuv, pos, metadata,
+                             geom_p, geom_a3, limit=1):
+    """Cache island-wide area, density, orientation, scale, center, and boundary data."""
+    key = (_array_digest(tri), _array_digest(inv), _array_digest(tuv), _array_digest(co))
+    cached = _ISLAND_REFERENCE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    face_isl = metadata["face_isl"]
+    point_isl = np.asarray(point_isl, dtype=np.int64)
+    island_count = metadata["island_count"]
+    q = signed_uv_area(tuv)
+    abs_area2 = np.bincount(face_isl, weights=np.abs(q), minlength=island_count)
+    total_a3 = np.bincount(face_isl, weights=geom_a3, minlength=island_count)
+    density_target = np.zeros(island_count, dtype=float)
+    np.divide(0.5 * abs_area2, total_a3, out=density_target, where=total_a3 > 1e-30)
+    positive = np.bincount(face_isl, weights=(q > 0.0), minlength=island_count)
+    negative = np.bincount(face_isl, weights=(q < 0.0), minlength=island_count)
+    orientation = np.where(positive >= negative, 1.0, -1.0)
+
+    uv_center = np.zeros((island_count, 2), dtype=float)
+    np.add.at(uv_center, point_isl, pos)
+    point_count = np.bincount(point_isl, minlength=island_count)
+    np.divide(uv_center, point_count[:, None], out=uv_center,
+              where=point_count[:, None] > 0)
+    uv_min = np.full((island_count, 2), np.inf)
+    uv_max = np.full((island_count, 2), -np.inf)
+    np.minimum.at(uv_min, point_isl, pos)
+    np.maximum.at(uv_max, point_isl, pos)
+    spread = np.linalg.norm(uv_max - uv_min, axis=1) + 1e-30
+
+    boundary_faces = metadata["boundary_faces"]
+    boundary_corners = metadata["boundary_corners"]
+    boundary_isl = metadata["boundary_isl"]
+    if len(boundary_faces):
+        edge_xyz = geom_p[boundary_faces[:, None], boundary_corners]
+        boundary_lengths = np.linalg.norm(edge_xyz[:, 1] - edge_xyz[:, 0], axis=1)
+    else:
+        boundary_lengths = np.zeros(0, dtype=float)
+    boundary_order, boundary_offsets = _group_offsets(boundary_isl, island_count)
+    cached = {
+        "total_a3": total_a3,
+        "area2": abs_area2,
+        "density_target": density_target,
+        "orientation": orientation,
+        "center": uv_center,
+        "spread": spread,
+        "boundary_order": boundary_order,
+        "boundary_offsets": boundary_offsets,
+        "boundary_edges": metadata["boundary_edges"],
+        "boundary_lengths": boundary_lengths,
+    }
+    _ISLAND_REFERENCE_CACHE[key] = cached
+    while len(_ISLAND_REFERENCE_CACHE) > limit:
+        _ISLAND_REFERENCE_CACHE.pop(next(iter(_ISLAND_REFERENCE_CACHE)))
+    return cached
+
+
+def island_boundary(metadata, references, island):
+    order = references["boundary_order"]
+    offsets = references["boundary_offsets"]
+    ids = order[offsets[island]:offsets[island + 1]]
+    return (references["boundary_edges"][ids],
+            references["boundary_lengths"][ids], len(ids))
+
+
+def cached_uv_geometry(co, tri, limit=1):
     """Return 3D corners, areas, and metric basis for an unchanged triangulated mesh."""
     co = np.asarray(co)
     tri = np.asarray(tri)
@@ -72,18 +229,6 @@ def cached_uv_geometry(co, tri, limit=4):
         _GEOMETRY_CACHE[key] = cached
         while len(_GEOMETRY_CACHE) > limit:
             _GEOMETRY_CACHE.pop(next(iter(_GEOMETRY_CACHE)))
-    return cached
-
-
-def cached_boundary_geometry(p, tl, limit=8):
-    """Return a triangulated region's 3D boundary geometry from a bounded cache."""
-    key = (_array_digest(p), _array_digest(tl))
-    cached = _BOUNDARY_CACHE.get(key)
-    if cached is None:
-        cached = boundary_geometry(p, tl)
-        _BOUNDARY_CACHE[key] = cached
-        while len(_BOUNDARY_CACHE) > limit:
-            _BOUNDARY_CACHE.pop(next(iter(_BOUNDARY_CACHE)))
     return cached
 
 
@@ -1300,35 +1445,46 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
 
 
 def _refresh_overlap_cache(cache, tl, u, lab, moved):
-    """Keep face boxes, SAT normals, and scales for faces that did not move.
-
-    The cache is deliberately supplied by one relax operation rather than kept globally.  UV edits
-    made between operator runs therefore cannot leave stale boxes behind, while the repeated
-    overlap rounds in one run avoid rebuilding the stationary part of the spatial data.
-    """
-    key = (id(tl), id(lab) if lab is not None else None, len(tl))
-    if cache.get("key") != key:
-        t = u[tl]
-        area2 = signed_uv_area(t)
-        edges = np.stack([t[:, 1] - t[:, 0], t[:, 2] - t[:, 1],
-                          t[:, 0] - t[:, 2]], 1)
-        normals = np.stack([-edges[..., 1], edges[..., 0]], -1)
-        scale = np.sqrt(2.0 * np.abs(area2) / 1.7320508) + 1e-30
-        cache.clear()
-        cache.update({"key": key, "area2": area2, "box": np.stack([t.min(1), t.max(1)], 1),
-                      "normals": normals, "scale": scale})
-        return
-    ids = np.arange(len(tl), dtype=np.int64) if moved is None else np.flatnonzero(moved)
-    if not len(ids):
-        return
-    t = u[tl[ids]]
-    area2 = signed_uv_area(t)
-    edges = np.stack([t[:, 1] - t[:, 0], t[:, 2] - t[:, 1],
-                      t[:, 0] - t[:, 2]], 1)
-    cache["area2"][ids] = area2
-    cache["box"][ids] = np.stack([t.min(1), t.max(1)], 1)
-    cache["normals"][ids] = np.stack([-edges[..., 1], edges[..., 0]], -1)
-    cache["scale"][ids] = np.sqrt(2.0 * np.abs(area2) / 1.7320508) + 1e-30
+    """Update cached face data without rebuilding unchanged UV geometry."""
+    profile = {name: cache.get(name, 0.0) for name in
+               ("refresh_ms", "candidate_ms", "sat_ms", "candidate_count",
+                "candidate_mode")}
+    key = (_array_digest(tl), _array_digest(lab) if lab is not None else None)
+    spatial = _OVERLAP_INDEX_CACHE.get(key)
+    current_uv = u[tl]
+    moved_ids = (np.arange(len(tl), dtype=np.int64) if moved is None
+                 else np.flatnonzero(moved))
+    if spatial is None:
+        area2 = signed_uv_area(current_uv)
+        box = np.stack([current_uv.min(1), current_uv.max(1)], 1)
+        edge = np.stack([current_uv[:, 1] - current_uv[:, 0],
+                         current_uv[:, 2] - current_uv[:, 1],
+                         current_uv[:, 0] - current_uv[:, 2]], 1)
+        normals = np.stack([-edge[..., 1], edge[..., 0]], -1)
+        spatial = {"box": box, "area2": area2, "normals": normals,
+                   "scale": np.sqrt(2.0 * np.abs(area2) / 1.7320508) + 1e-30,
+                   "previous_uv": current_uv.copy(), "moved_ids": moved_ids}
+        _OVERLAP_INDEX_CACHE[key] = spatial
+        while len(_OVERLAP_INDEX_CACHE) > 1:
+            _OVERLAP_INDEX_CACHE.pop(next(iter(_OVERLAP_INDEX_CACHE)))
+    else:
+        changed = np.flatnonzero(np.any(current_uv != spatial["previous_uv"], axis=(1, 2)))
+        if len(changed):
+            t = current_uv[changed]
+            area2 = signed_uv_area(t)
+            box = np.stack([t.min(1), t.max(1)], 1)
+            edge = np.stack([t[:, 1] - t[:, 0], t[:, 2] - t[:, 1],
+                             t[:, 0] - t[:, 2]], 1)
+            spatial["area2"][changed] = area2
+            spatial["box"][changed] = box
+            spatial["normals"][changed] = np.stack([-edge[..., 1], edge[..., 0]], -1)
+            spatial["scale"][changed] = np.sqrt(2.0 * np.abs(area2) / 1.7320508) + 1e-30
+            spatial["previous_uv"][changed] = t
+        spatial["moved_ids"] = moved_ids
+    cache.clear()
+    cache.update(spatial)
+    cache.update(profile)
+    cache.setdefault("candidate_mode", "skipped")
 
 
 def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
@@ -1347,12 +1503,9 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
     way a conformal triangulation meets along a shared edge does not count against the island, and
     neither does a block of faces that was itself stamped down to a hundredth of its size.
 
-    The broad phase sweeps the boxes in x: each face is compared with the faces whose left edge
-    starts inside its own span, which is every pair that could possibly overlap and no pair that
-    could not, then the y boxes and the island labels filter the list, and the rest is tested in
-    blocks.  That keeps the work linear for an island of roughly equally sized faces; a face whose
-    x span holds more than `window` others is beyond what this counts, and that case is an island
-    stamped over itself wholesale, where the answer is a seam anyway.
+    Face boxes and SAT axes stay cached between overlap rounds. Dense movement uses a vectorized
+    x-sweep; sparse movement sweeps the moving faces and checks them against the stationary boxes.
+    Both paths feed the same SAT test in blocks.
 
     tl: (T,3) point ids, u: (V,2) their UV coordinates, lab: (T,) island label per face, or None to
     compare every face in the batch with every other.  `moved`: (T,) bool, which faces this relax was
@@ -1363,49 +1516,55 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
     the matching face-index pairs, with the within-island pairs first."""
     if overlap_cache is None:
         overlap_cache = {}
+    refresh_t0 = time.perf_counter()
     _refresh_overlap_cache(overlap_cache, tl, u, lab, moved)
+    overlap_cache["refresh_ms"] += (time.perf_counter() - refresh_t0) * 1000.0
+    overlap_cache["candidate_mode"] = "skipped"
     area2_all = overlap_cache["area2"]
     box_all = overlap_cache["box"]
     edge_normals_all = overlap_cache["normals"]
     scale_all = overlap_cache["scale"]
-    t = u[tl]
     area2 = area2_all
     biggest = float(np.abs(area2).max()) if len(area2) else 0.0
-    f = np.flatnonzero(np.abs(area2) > 1e-12 * max(biggest, 1e-30))
-    if f.size < 2:
+    area_threshold = 1e-12 * max(biggest, 1e-30)
+    valid = np.abs(area2) > area_threshold
+    valid_ids = np.flatnonzero(valid)
+    if valid_ids.size < 2:
         empty = np.zeros((0, 2), np.int64)
         return (0, 0, empty) if return_pairs else (0, 0)
-    t = t[f]
-    n = len(t)
-    lab = np.zeros(n, np.int64) if lab is None else np.asarray(lab)[f]
-    mv = None if moved is None else np.asarray(moved)[f]
+    face_labels_all = np.zeros(len(tl), np.int64) if lab is None else np.asarray(lab)
+    moved_all = None if moved is None else np.asarray(moved, dtype=bool)
+    f = valid_ids
+    n = len(f)
     box = box_all[f]
     edge_normals = edge_normals_all[f]
-    # each face's own size, from its area: the edge of an equilateral triangle of double area S is
-    # sqrt(2 S / sqrt 3)
     scale = scale_all[f]
+    face_labels = face_labels_all[f]
+    mv = None if moved_all is None else moved_all[f]
+
     def sweep_candidates(indices):
-        """Build the old bounded x-sweep for a compact set of face indices."""
+        """Build the bounded x-sweep for a compact set of valid faces."""
         if len(indices) < 2:
             return np.zeros(0, np.int64), np.zeros(0, np.int64)
-        local_order = indices[np.argsort(box[indices, 0, 0])]
-        left = box[local_order, 0, 0]
-        ends = np.searchsorted(left, box[local_order, 1, 0], side="right")
-        cnt = np.clip(ends - np.arange(len(indices)) - 1, 0, window)
-        total = int(cnt.sum())
+        order = indices[np.argsort(box[indices, 0, 0])]
+        left = box[order, 0, 0]
+        ends = np.searchsorted(left, box[order, 1, 0], side="right")
+        counts = np.clip(ends - np.arange(len(indices)) - 1, 0, window)
+        total = int(counts.sum())
         if total == 0:
             return np.zeros(0, np.int64), np.zeros(0, np.int64)
-        starts = np.cumsum(cnt) - cnt
-        ii = np.repeat(np.arange(len(indices)), cnt)
-        jj = ii + 1 + (np.arange(total) - np.repeat(starts, cnt))
-        return local_order[ii], local_order[jj]
+        starts = np.cumsum(counts) - counts
+        ii = np.repeat(np.arange(len(indices)), counts)
+        jj = ii + 1 + (np.arange(total) - np.repeat(starts, counts))
+        return order[ii], order[jj]
 
-    if mv is None or int(mv.sum()) >= max(2, n // 2):
-        # Dense/full-island path: one sweep over all valid faces, preserving the original cap.
+    candidate_t0 = time.perf_counter()
+    # The all-face query is a single vectorized operation and wins once movement is dense.
+    dense = mv is None or int(mv.sum()) >= max(2, n // 2)
+    overlap_cache["candidate_mode"] = "dense" if dense else "sparse"
+    if dense:
         a, b = sweep_candidates(np.arange(n, dtype=np.int64))
     else:
-        # Sparse path: stationary boxes stay in the cached x index.  Only moved faces are queried
-        # against that index; the moved subset is swept separately so no pair is duplicated.
         moving = np.flatnonzero(mv)
         stationary = np.flatnonzero(~mv)
         aa, bb = sweep_candidates(moving)
@@ -1429,11 +1588,15 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
         else:
             a, b = aa, bb
     if len(a) == 0:
+        overlap_cache["candidate_ms"] += (time.perf_counter() - candidate_t0) * 1000.0
         empty = np.zeros((0, 2), np.int64)
         return (0, 0, empty) if return_pairs else (0, 0)
-    sel = (box[a, 1, 1] > box[b, 0, 1]) & (box[b, 1, 1] > box[a, 0, 1])
+    sel = ((box[a, 1, 1] > box[b, 0, 1])
+           & (box[b, 1, 1] > box[a, 0, 1]))
     a, b = a[sel], b[sel]
-    same = lab[a] == lab[b]
+    same = face_labels[a] == face_labels[b]
+    overlap_cache["candidate_ms"] += (time.perf_counter() - candidate_t0) * 1000.0
+    overlap_cache["candidate_count"] += float(len(a))
 
     def narrow(ii):
         """Return the indices of overlapping candidates after the separating-axis test."""
@@ -1470,7 +1633,10 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
     # then split the surviving indices into within-island and across-island results.
     sat_candidates = (np.arange(len(a), dtype=np.int64) if mv is not None
                       else np.flatnonzero(same))
+    sat_t0 = time.perf_counter()
+    t = u[tl[f]]
     hit_idx = narrow(sat_candidates)
+    overlap_cache["sat_ms"] += (time.perf_counter() - sat_t0) * 1000.0
     same_hit = same[hit_idx]
     same_idx = hit_idx[same_hit]
     across_idx = hit_idx[~same_hit] if mv is not None else np.zeros(0, np.int64)
