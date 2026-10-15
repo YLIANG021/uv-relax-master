@@ -22,19 +22,26 @@ def _array_digest(array):
     return (array.shape, array.dtype.str, digest)
 
 
-def cached_uv_topology(tri, tuv, limit=1):
+def cached_uv_topology(tri, tuv, limit=1, profile=None):
     """Return UV point ids and island labels, reusing unchanged mesh/UV seam topology."""
+    total_t0 = time.perf_counter()
+    profile = profile if profile is not None else {}
+    profile.update(cache="miss", signature_ms=0.0, build_ms=0.0)
     tri = np.asarray(tri)
     tuv = np.asarray(tuv)
     quantized_uv = np.rint(tuv * 1e5).astype(np.int64)
     key = _array_digest(tri)
     uv_signature = _array_digest(quantized_uv)
+    signature_t1 = time.perf_counter()
+    profile["signature_ms"] = (signature_t1 - total_t0) * 1000.0
     entries = _TOPOLOGY_CACHE.setdefault(key, [])
     corner_uv = quantized_uv.reshape(-1, 2)
     corner_vertex = tri.reshape(-1)
     for entry_index, entry in enumerate(entries):
         inv, point_isl, point_vertex, first_corner, metadata, cached_uv_signature = entry
         if cached_uv_signature == uv_signature:
+            profile["cache"] = "hit"
+            profile["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
             return inv, point_isl, metadata
         representative_uv = corner_uv[first_corner]
         # A changed value is harmless when every corner belonging to a cached UV point changed
@@ -48,8 +55,11 @@ def cached_uv_topology(tri, tuv, limit=1):
             continue
         entries[entry_index] = (inv, point_isl, point_vertex, first_corner,
                                 metadata, uv_signature)
+        profile["cache"] = "uv_refresh"
+        profile["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
         return inv, point_isl, metadata
 
+    build_t0 = time.perf_counter()
     inv = uvvert_ids(tri, tuv)
     U = int(inv.max()) + 1
     point_isl = islands(inv, U)
@@ -66,6 +76,8 @@ def cached_uv_topology(tri, tuv, limit=1):
         entries.pop(0)
     while len(_TOPOLOGY_CACHE) > 1:
         _TOPOLOGY_CACHE.pop(next(iter(_TOPOLOGY_CACHE)))
+    profile["build_ms"] = (time.perf_counter() - build_t0) * 1000.0
+    profile["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
     return inv, point_isl, metadata
 
 
@@ -152,13 +164,20 @@ def incident_faces(metadata, point_ids):
 
 
 def cached_island_references(co, tri, inv, point_isl, tuv, pos, metadata,
-                             geom_p, geom_a3, limit=1):
+                             geom_p, geom_a3, limit=1, profile=None):
     """Cache island-wide area, density, orientation, scale, center, and boundary data."""
+    total_t0 = time.perf_counter()
+    profile = profile if profile is not None else {}
+    profile.update(cache="miss", signature_ms=0.0, build_ms=0.0)
     key = (_array_digest(tri), _array_digest(inv), _array_digest(tuv), _array_digest(co))
+    profile["signature_ms"] = (time.perf_counter() - total_t0) * 1000.0
     cached = _ISLAND_REFERENCE_CACHE.get(key)
     if cached is not None:
+        profile["cache"] = "hit"
+        profile["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
         return cached
 
+    build_t0 = time.perf_counter()
     face_isl = metadata["face_isl"]
     point_isl = np.asarray(point_isl, dtype=np.int64)
     island_count = metadata["island_count"]
@@ -206,6 +225,8 @@ def cached_island_references(co, tri, inv, point_isl, tuv, pos, metadata,
     _ISLAND_REFERENCE_CACHE[key] = cached
     while len(_ISLAND_REFERENCE_CACHE) > limit:
         _ISLAND_REFERENCE_CACHE.pop(next(iter(_ISLAND_REFERENCE_CACHE)))
+    profile["build_ms"] = (time.perf_counter() - build_t0) * 1000.0
+    profile["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
     return cached
 
 
@@ -217,18 +238,27 @@ def island_boundary(metadata, references, island):
             references["boundary_lengths"][ids], len(ids))
 
 
-def cached_uv_geometry(co, tri, limit=1):
+def cached_uv_geometry(co, tri, limit=1, profile=None):
     """Return 3D corners, areas, and metric basis for an unchanged triangulated mesh."""
+    total_t0 = time.perf_counter()
+    profile = profile if profile is not None else {}
+    profile.update(cache="miss", signature_ms=0.0, build_ms=0.0)
     co = np.asarray(co)
     tri = np.asarray(tri)
     key = (_array_digest(co), _array_digest(tri))
+    profile["signature_ms"] = (time.perf_counter() - total_t0) * 1000.0
     cached = _GEOMETRY_CACHE.get(key)
     if cached is None:
+        build_t0 = time.perf_counter()
         p, a3 = uv3d(co, tri)
         cached = (p, a3, face_metric_prep(p))
         _GEOMETRY_CACHE[key] = cached
+        profile["build_ms"] = (time.perf_counter() - build_t0) * 1000.0
         while len(_GEOMETRY_CACHE) > limit:
             _GEOMETRY_CACHE.pop(next(iter(_GEOMETRY_CACHE)))
+    else:
+        profile["cache"] = "hit"
+    profile["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
     return cached
 
 
@@ -677,6 +707,238 @@ BOUNDARY_WEIGHT_BASE = 0.12
 BOUNDARY_WEIGHT_DENSITY = 0.42
 
 
+def _local_symmetric_dirichlet_solve(p, tl, uv0, pin, maxit, density_weight,
+                                     total_a3_override=None, density_target_override=None,
+                                     majority_orientation=None, boundary_weight=None,
+                                     boundary_edges_override=None,
+                                     boundary_3d_length_override=None,
+                                     boundary_count_override=None):
+    """Minimize the true symmetric-Dirichlet energy with fixed selection-boundary UVs.
+
+    This optimizer is deliberately separate from the whole-island re-charting solver.  It uses
+    limited-memory BFGS on only the movable coordinates, and rejects trial steps that invert a
+    triangle.  Folded or degenerate input falls back to the established fold-repair path.
+    """
+    p = np.asarray(p, dtype=float)
+    tl = np.asarray(tl, dtype=np.int64)
+    uv0 = np.asarray(uv0, dtype=float).copy()
+    pin = np.asarray(pin, dtype=bool)
+    point_count = len(uv0)
+    face_count = len(tl)
+    free_ids = np.flatnonzero(~pin)
+    profile = {"model_ms": 0.0, "preconditioner_ms": 0.0,
+               "cg_ms": 0.0, "line_search_ms": 0.0}
+    if not len(free_ids) or not face_count:
+        return None
+
+    model_t0 = time.perf_counter()
+    a3 = 0.5 * np.linalg.norm(np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), axis=1)
+    if np.any(a3 <= 1e-30):
+        return None
+    total_a3 = float(a3.sum()) if total_a3_override is None else float(total_a3_override)
+    if total_a3 <= 1e-30:
+        return None
+    prepped = face_metric_prep(p)
+    signs = np.sign(signed_uv_area(uv0[tl]))
+    nz = signs[signs != 0.0]
+    majority = (1.0 if (nz > 0.0).sum() >= (nz < 0.0).sum() else -1.0
+                ) if majority_orientation is None else float(majority_orientation)
+    if np.any(signs != majority):
+        return None
+
+    face_weight = a3 / total_a3
+    q = signed_uv_area(uv0[tl])
+    density_target = (float(np.abs(q).sum()) / (2.0 * total_a3)
+                      if density_target_override is None else float(density_target_override))
+    if density_target <= 1e-30:
+        return None
+    density_weight = max(float(density_weight), 0.0)
+    target_sqrt = np.sqrt(density_target)
+
+    if boundary_edges_override is None:
+        boundary_edges, boundary_lengths = boundary_geometry(p, tl)
+        boundary_count = len(boundary_edges)
+    else:
+        boundary_edges = np.asarray(boundary_edges_override, dtype=np.int64)
+        boundary_lengths = np.asarray(boundary_3d_length_override, dtype=float)
+        boundary_count = (len(boundary_edges) if boundary_count_override is None
+                          else int(boundary_count_override))
+    if boundary_weight is None:
+        boundary_weight = BOUNDARY_WEIGHT_BASE + BOUNDARY_WEIGHT_DENSITY * min(
+            density_weight, 1.0)
+    boundary_weight = max(float(boundary_weight), 0.0)
+    boundary_target = target_sqrt * boundary_lengths
+    boundary_weights = (np.full(len(boundary_edges), boundary_weight / boundary_count)
+                        if len(boundary_edges) and boundary_count > 0
+                        else np.zeros(len(boundary_edges)))
+    def evaluate(u, need_gradient=True):
+        uv_tri = u[tl]
+        s1 = uv_tri[:, 1] - uv_tri[:, 0]
+        s2 = uv_tri[:, 2] - uv_tri[:, 0]
+        S = np.stack([np.stack([s1[:, 0], s2[:, 0]], axis=1),
+                      np.stack([s1[:, 1], s2[:, 1]], axis=1)], axis=1)
+        K = S @ prepped
+        det = K[:, 0, 0] * K[:, 1, 1] - K[:, 0, 1] * K[:, 1, 0]
+        oriented_det = majority * det
+        if np.any(oriented_det <= max(density_target * 1e-12, 1e-30)):
+            return np.inf, None
+        inv = np.empty_like(K)
+        inv[:, 0, 0] = K[:, 1, 1] / det
+        inv[:, 1, 1] = K[:, 0, 0] / det
+        inv[:, 0, 1] = -K[:, 0, 1] / det
+        inv[:, 1, 0] = -K[:, 1, 0] / det
+        energy_face = (K * K).sum(axis=(1, 2)) / density_target
+        energy_face += density_target * (inv * inv).sum(axis=(1, 2))
+        value = float(np.dot(face_weight, energy_face))
+
+        grad_uv = None
+        if need_gradient:
+            grad_k = 2.0 * K / density_target
+            grad_k -= (2.0 * density_target *
+                       (inv.transpose(0, 2, 1) @ inv @ inv.transpose(0, 2, 1)))
+
+            if density_weight > 0.0:
+                log_ratio = np.log(np.maximum(oriented_det / density_target, 1e-30))
+                cap = np.log(DENSITY_CAP)
+                err = np.clip(log_ratio, -cap, cap)
+                value += density_weight * float(np.dot(face_weight, err * err))
+                # Match the existing robust density term: residuals saturate, while their
+                # derivative keeps a bounded, useful direction for badly scaled faces.
+                density_derivative = np.where(np.abs(log_ratio) < cap, err, 0.0)
+                inv_t = inv.transpose(0, 2, 1)
+                grad_k += (2.0 * density_weight * density_derivative)[:, None, None] * inv_t
+
+            grad_s = grad_k @ prepped.transpose(0, 2, 1)
+            grad_tri = np.empty((face_count, 3, 2), dtype=float)
+            grad_tri[:, 1] = grad_s[:, :, 0]
+            grad_tri[:, 2] = grad_s[:, :, 1]
+            grad_tri[:, 0] = -grad_tri[:, 1] - grad_tri[:, 2]
+            grad_uv = np.zeros((point_count, 2), dtype=float)
+            np.add.at(grad_uv, tl.ravel(), (grad_tri * face_weight[:, None, None]).reshape(-1, 2))
+
+        if len(boundary_edges):
+            delta = u[boundary_edges[:, 1]] - u[boundary_edges[:, 0]]
+            length2 = np.einsum("ei,ei->e", delta, delta)
+            length = np.sqrt(np.maximum(length2, 1e-30))
+            ratio = np.maximum(length / np.maximum(boundary_target, 1e-30), 1e-30)
+            log_ratio = np.log(ratio)
+            cap = BOUNDARY_LOG_CAP
+            error = np.clip(log_ratio, -cap, cap)
+            value += float(np.dot(boundary_weights, error * error))
+            if need_gradient:
+                derivative = np.where(np.abs(log_ratio) < cap, error, 0.0)
+                edge_grad = (2.0 * boundary_weights * derivative / length2)[:, None] * delta
+                np.add.at(grad_uv, boundary_edges[:, 0], -edge_grad)
+                np.add.at(grad_uv, boundary_edges[:, 1], edge_grad)
+
+        return value, grad_uv
+
+    start_value, start_gradient = evaluate(uv0)
+    if not np.isfinite(start_value) or start_gradient is None:
+        return None
+    profile["model_ms"] = (time.perf_counter() - model_t0) * 1000.0
+    cg_t0 = time.perf_counter()
+    x = uv0[free_ids].reshape(-1).copy()
+    base = uv0.copy()
+    history_s = []
+    history_y = []
+    history_rho = []
+    value = start_value
+    gradient = start_gradient[free_ids].reshape(-1)
+    initial_norm = float(np.linalg.norm(gradient))
+    converged = initial_norm <= 1e-10
+    iterations = 0
+    max_iterations = max(1, int(maxit))
+    memory = 8
+
+    for iteration in range(max_iterations):
+        grad_norm = float(np.linalg.norm(gradient))
+        if grad_norm <= max(1e-7 * initial_norm, 1e-10):
+            converged = True
+            break
+
+        direction = gradient.copy()
+        alphas = []
+        for s_vec, y_vec, rho in zip(reversed(history_s), reversed(history_y),
+                                     reversed(history_rho)):
+            alpha = rho * float(np.dot(s_vec, direction))
+            alphas.append(alpha)
+            direction -= alpha * y_vec
+        if history_s:
+            sy = float(np.dot(history_s[-1], history_y[-1]))
+            yy = float(np.dot(history_y[-1], history_y[-1]))
+            direction *= sy / max(yy, 1e-30)
+        for (s_vec, y_vec, rho), alpha in zip(
+                zip(history_s, history_y, history_rho), reversed(alphas)):
+            beta = rho * float(np.dot(y_vec, direction))
+            direction += s_vec * (alpha - beta)
+        direction = -direction
+        slope = float(np.dot(gradient, direction))
+        if not np.isfinite(slope) or slope >= -1e-20:
+            history_s.clear()
+            history_y.clear()
+            history_rho.clear()
+            direction = -gradient
+            slope = -float(np.dot(gradient, gradient))
+
+        line_t0 = time.perf_counter()
+        accepted = None
+        step = 1.0
+        for _ in range(24):
+            trial = base.copy()
+            trial[free_ids] = (x + step * direction).reshape(-1, 2)
+            trial_value, trial_gradient = evaluate(trial)
+            if (np.isfinite(trial_value) and
+                    trial_value <= value + 1e-4 * step * slope):
+                accepted = (trial, trial_value, trial_gradient, x + step * direction)
+                break
+            step *= 0.5
+        profile["line_search_ms"] += (time.perf_counter() - line_t0) * 1000.0
+        if accepted is None:
+            break
+
+        next_base, next_value, next_gradient_uv, next_x = accepted
+        next_gradient = next_gradient_uv[free_ids].reshape(-1)
+        s_vec = next_x - x
+        y_vec = next_gradient - gradient
+        sy = float(np.dot(s_vec, y_vec))
+        if sy > 1e-12 * np.linalg.norm(s_vec) * max(np.linalg.norm(y_vec), 1e-30):
+            history_s.append(s_vec)
+            history_y.append(y_vec)
+            history_rho.append(1.0 / sy)
+            if len(history_s) > memory:
+                history_s.pop(0)
+                history_y.pop(0)
+                history_rho.pop(0)
+        x = next_x
+        base = next_base
+        value = next_value
+        gradient = next_gradient
+        iterations = iteration + 1
+
+    profile["cg_ms"] = (time.perf_counter() - cg_t0) * 1000.0
+    if iterations == 0 and not converged:
+        # A failed first line search is outside this optimizer's basin.  Let the established
+        # fold-aware solver handle it instead of reporting a false no-op.
+        return None
+    if iterations == 0:
+        return uv0.copy(), {
+            "free": len(free_ids), "pass": 0, "solve": 1, "gain": 0.0,
+            "why": "already even", "fold": 0, "ask": "open",
+            "converged": converged, "fold_left": 0,
+            "algorithm": "local_sd_lbfgs",
+            "reinitialized": False, "capped_holes": 0, **profile,
+        }
+    final_value = value
+    return base, {
+        "free": len(free_ids), "pass": iterations, "solve": 1,
+        "gain": start_value - final_value, "why": "relaxed", "fold": 0,
+        "ask": "open", "converged": converged, "fold_left": 0,
+        "algorithm": "local_sd_lbfgs",
+        "reinitialized": False, "capped_holes": 0, **profile,
+    }
+
+
 def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 fold_rounds=6, density_refine=8, density_tol=0.3,
                 density_face_weight=None, boundary_weight=None,
@@ -685,7 +947,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 majority_orientation=None, boundary_edges_override=None,
                 boundary_3d_length_override=None, boundary_count_override=None,
                 scale_center_override=None, reinitialize=False,
-                energy_mode="conformal", cap_holes=False):
+                energy_mode="conformal", cap_holes=False, local_solver=False):
     """Bring one island to the evenest shape its boundary allows -- by solving for it.
 
     The conformal part of the energy this relaxes is a quadratic form in the UV coordinates:
@@ -759,6 +1021,18 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
     V = output_V
     uv0 = np.asarray(uv0, dtype=float).copy()
     pin = np.asarray(pin, dtype=bool).copy()
+    if local_solver and not reinitialize and not cap_holes:
+        local_result = _local_symmetric_dirichlet_solve(
+            p, tl, uv0, pin, maxit=maxit, density_weight=density_weight,
+            total_a3_override=total_a3_override,
+            density_target_override=density_target_override,
+            majority_orientation=majority_orientation,
+            boundary_weight=boundary_weight,
+            boundary_edges_override=boundary_edges_override,
+            boundary_3d_length_override=boundary_3d_length_override,
+            boundary_count_override=boundary_count_override)
+        if local_result is not None:
+            return local_result
     virtual_holes = 0
     real_face_count = len(tl)
     if cap_holes and not pin.any():
@@ -1125,6 +1399,9 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
 
     stats = {"free": int((~held).sum()), "pass": 0, "solve": 0, "gain": 0.0, "why": "relaxed",
              "fold": int(wrong.sum()), "ask": None, "converged": True, "fold_left": 0,
+             "algorithm": ("local_fallback_sd_cg" if local_solver else
+                           "whole_island_sd_cg" if symmetric_dirichlet else
+                           "whole_island_conformal_cg"),
              "reinitialized": reinitialized, "capped_holes": int(virtual_holes), **profile}
     if held.all():
         stats["why"] = "nothing to move"

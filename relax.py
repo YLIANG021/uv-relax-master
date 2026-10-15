@@ -93,10 +93,13 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         tuv = uvs[lt]
         read_ms = (time.perf_counter() - t0) * 1000.0
 
-        inv, point_isl, topology = core.cached_uv_topology(tri, tuv)
+        topology_profile = {}
+        inv, point_isl, topology = core.cached_uv_topology(
+            tri, tuv, profile=topology_profile)
         U = int(inv.max()) + 1
         isl = topology["face_isl"]
 
+        selection_t0 = time.perf_counter()
         sync = bool(context.tool_settings.use_uv_select_sync)
         sync_uv_valid = bool(sync and getattr(bm, "uv_select_sync_valid", False))
         selection_source = ("UV_CORNERS" if sync_uv_valid else "MESH") if sync else "UV"
@@ -124,11 +127,11 @@ class UVRELAX_OT_relax(bpy.types.Operator):
              len(scope_face_ids), len(labs),
              selection_source,
              int(self.steps), float(self.density_weight)))
-        setup_ms = (time.perf_counter() - t0) * 1000.0 - read_ms
 
         pos = np.zeros((U, 2))
         pos[inv.ravel()] = tuv.reshape(-1, 2)
         movable_uv = np.zeros(U, dtype=bool)
+        selection_ms = (time.perf_counter() - selection_t0) * 1000.0
 
         relaxed = 0
         points = 0
@@ -144,6 +147,7 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         solves = 0
         solver_profile = {"model_ms": 0.0, "preconditioner_ms": 0.0,
                           "cg_ms": 0.0, "line_search_ms": 0.0}
+        solver_algorithms = set()
         reduced_islands = 0
         reduced_faces = 0
         reduced_points = 0
@@ -154,9 +158,18 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         local_rings = 0
         reinitialized_islands = 0
         capped_holes = 0
-        geom_p, geom_a3, geom_metric_prep = core.cached_uv_geometry(co, tri)
+        geometry_profile = {}
+        geometry_t0 = time.perf_counter()
+        geom_p, geom_a3, geom_metric_prep = core.cached_uv_geometry(
+            co, tri, profile=geometry_profile)
+        geometry_ms = (time.perf_counter() - geometry_t0) * 1000.0
+        island_reference_profile = {}
+        island_reference_t0 = time.perf_counter()
         island_refs = core.cached_island_references(
-            co, tri, inv, point_isl, tuv, pos, topology, geom_p, geom_a3)
+            co, tri, inv, point_isl, tuv, pos, topology, geom_p, geom_a3,
+            profile=island_reference_profile)
+        island_reference_ms = (time.perf_counter() - island_reference_t0) * 1000.0
+        setup_ms = (time.perf_counter() - t0) * 1000.0 - read_ms
         solve_t0 = time.perf_counter()
         for lab in labs:
             all_ids = core.grouped_indices(topology, int(lab), "point")
@@ -252,11 +265,13 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                 # A complete island can be safely re-charted from its 3D geometry.  A partial
                 # selection must keep its current UV as the fixed-boundary problem's initial state.
                 reinitialize=not local_mode,
-                energy_mode=("symmetric_dirichlet" if not local_mode else "conformal"),
+                energy_mode="symmetric_dirichlet",
                 cap_holes=not local_mode,
+                local_solver=local_mode,
                 **solve_kwargs)
             for key in solver_profile:
                 solver_profile[key] += st.get(key, 0.0)
+            solver_algorithms.add(st.get("algorithm", "unknown"))
             reinitialized_islands += int(st.get("reinitialized", False))
             capped_holes += int(st.get("capped_holes", 0))
             if st["pass"] == 0:
@@ -318,10 +333,19 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                         "Nothing relaxed: " + ", ".join(why))
             _console_log(
                 "CANCEL object=%s reason=nothing_relaxed elapsed_ms=%.1f read_ms=%.1f "
-            "setup_ms=%.1f solve_ms=%.1f islands=%d reduced_islands=%d "
+            "setup_ms=%.1f topology_ms=%.1f topology_build_ms=%.1f topology_cache=%s "
+            "selection_ms=%.1f geometry_ms=%.1f geometry_build_ms=%.1f geometry_cache=%s "
+            "island_ref_ms=%.1f island_ref_build_ms=%.1f island_ref_cache=%s "
+            "solve_ms=%.1f islands=%d reduced_islands=%d "
             "reduced_faces=%d reduced_points=%d solves=%d cg_passes=%d" %
                 (context.active_object.name, (time.perf_counter() - t0) * 1000.0,
-                 read_ms, setup_ms, (time.perf_counter() - solve_t0) * 1000.0,
+                 read_ms, setup_ms,
+                 topology_profile["total_ms"], topology_profile["build_ms"],
+                 topology_profile["cache"], selection_ms,
+                 geometry_ms, geometry_profile["build_ms"], geometry_profile["cache"],
+                 island_reference_ms, island_reference_profile["build_ms"],
+                 island_reference_profile["cache"],
+                 (time.perf_counter() - solve_t0) * 1000.0,
                  len(labs), reduced_islands, reduced_faces, reduced_points, solves, took))
             return {"CANCELLED"}
 
@@ -394,10 +418,16 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         post_ms = (time.perf_counter() - post_t0) * 1000.0
         ms = (time.perf_counter() - t0) * 1000.0
         _console_log(
-            "DONE object=%s elapsed_ms=%.1f read_ms=%.1f setup_ms=%.1f solve_ms=%.1f "
+            "DONE object=%s elapsed_ms=%.1f read_ms=%.1f setup_ms=%.1f "
+            "topology_ms=%.1f topology_signature_ms=%.1f topology_build_ms=%.1f topology_cache=%s "
+            "selection_ms=%.1f geometry_ms=%.1f geometry_signature_ms=%.1f "
+            "geometry_build_ms=%.1f geometry_cache=%s "
+            "island_ref_ms=%.1f island_ref_signature_ms=%.1f island_ref_build_ms=%.1f "
+            "island_ref_cache=%s solve_ms=%.1f "
             "write_ms=%.1f post_ms=%.1f metric_ms=%.1f overlap_ms=%.1f "
             "overlap_refresh_ms=%.1f overlap_candidate_ms=%.1f overlap_sat_ms=%.1f "
             "overlap_candidates=%d overlap_mode=%s "
+            "solver=%s "
             "solver_model_ms=%.1f precond_ms=%.1f cg_ms=%.1f density_line_ms=%.1f "
             "solver_misc_ms=%.1f "
             "selected_verts=%d selected_edges=%d "
@@ -406,10 +436,17 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             "cg_passes=%d overlap_fix=%d->%d/%d "
             "selection_source=%s steps=%d density=%.3f reinitialized=%d capped_holes=%d "
             "local_faces=%d local_points=%d selected_points=%d halo_points=%d halo_rings=%d" %
-            (context.active_object.name, ms, read_ms, setup_ms, solve_ms, write_ms, post_ms,
+            (context.active_object.name, ms, read_ms, setup_ms,
+             topology_profile["total_ms"], topology_profile["signature_ms"],
+             topology_profile["build_ms"], topology_profile["cache"], selection_ms,
+             geometry_ms, geometry_profile["signature_ms"], geometry_profile["build_ms"],
+             geometry_profile["cache"], island_reference_ms,
+             island_reference_profile["signature_ms"], island_reference_profile["build_ms"],
+             island_reference_profile["cache"], solve_ms, write_ms, post_ms,
              metric_ms, overlap_ms, overlap_cache["refresh_ms"],
              overlap_cache["candidate_ms"], overlap_cache["sat_ms"],
              int(overlap_cache["candidate_count"]), overlap_cache["candidate_mode"],
+             ",".join(sorted(solver_algorithms)),
              solver_profile["model_ms"], solver_profile["preconditioner_ms"],
              solver_profile["cg_ms"], solver_profile["line_search_ms"],
              solver_profile["misc_ms"],
