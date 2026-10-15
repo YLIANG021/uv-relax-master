@@ -985,7 +985,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 boundary_3d_length_override=None, boundary_count_override=None,
                 scale_center_override=None, reinitialize=False,
                 energy_mode="conformal", cap_holes=False, local_solver=False,
-                whole_island_solver="LBFGS"):
+                whole_island_solver="CG"):
     """Bring one island to the evenest shape its boundary allows -- by solving for it.
 
     The conformal part of the energy this relaxes is a quadratic form in the UV coordinates:
