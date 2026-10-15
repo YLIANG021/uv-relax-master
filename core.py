@@ -713,11 +713,10 @@ def _local_symmetric_dirichlet_solve(p, tl, uv0, pin, maxit, density_weight,
                                      boundary_edges_override=None,
                                      boundary_3d_length_override=None,
                                      boundary_count_override=None):
-    """Minimize the true symmetric-Dirichlet energy with fixed selection-boundary UVs.
+    """Minimize true symmetric-Dirichlet energy over the free UV coordinates.
 
-    This optimizer is deliberately separate from the whole-island re-charting solver.  It uses
-    limited-memory BFGS on only the movable coordinates, and rejects trial steps that invert a
-    triangle.  Folded or degenerate input falls back to the established fold-repair path.
+    Limited-memory BFGS leaves pinned coordinates untouched and rejects trial steps that invert a
+    triangle. Folded or degenerate input falls back to the established fold-repair path.
     """
     p = np.asarray(p, dtype=float)
     tl = np.asarray(tl, dtype=np.int64)
@@ -947,7 +946,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 majority_orientation=None, boundary_edges_override=None,
                 boundary_3d_length_override=None, boundary_count_override=None,
                 scale_center_override=None, reinitialize=False,
-                energy_mode="conformal", cap_holes=False, local_solver=False):
+                energy_mode="conformal", cap_holes=False, local_solver=False,
+                whole_island_solver="LBFGS"):
     """Bring one island to the evenest shape its boundary allows -- by solving for it.
 
     The conformal part of the energy this relaxes is a quadratic form in the UV coordinates:
@@ -1137,6 +1137,31 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
     boundary_weight = max(float(boundary_weight), 0.0)
     boundary_weights = (np.full(len(boundary_edges), boundary_weight / boundary_count)
                         if len(boundary_edges) else np.zeros(0, dtype=float))
+
+    # Try L-BFGS only after the existing hole-cap and severe-chart repair steps produce a valid,
+    # consistently oriented chart. Unsupported input falls through to the established CG path.
+    if (str(whole_island_solver).upper() == "LBFGS" and symmetric_dirichlet and
+            not local_solver and not pin.any() and not fold):
+        lbfgs_result = _local_symmetric_dirichlet_solve(
+            p, tl, uv0, pin, maxit=maxit, density_weight=density_weight,
+            total_a3_override=total_a3_override,
+            density_target_override=density_target_override,
+            majority_orientation=maj,
+            boundary_weight=boundary_weight,
+            boundary_edges_override=boundary_edges,
+            boundary_3d_length_override=boundary_3d_length,
+            boundary_count_override=boundary_count)
+        if lbfgs_result is not None:
+            result_uv, result_stats = lbfgs_result
+            result_stats.update({
+                "algorithm": "whole_island_sd_lbfgs",
+                "free": int((~pin[:output_V]).sum()),
+                "fold": int(wrong.sum()),
+                "fold_left": 0,
+                "reinitialized": reinitialized,
+                "capped_holes": int(virtual_holes),
+            })
+            return result_uv[:output_V].copy(), result_stats
 
     def shape(u):
         """How uneven the island is, the way the overlay sees it: every face's stretch above 1.0
@@ -1715,7 +1740,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         # a no-op for anything the density rounds touched -- they keep the area themselves -- but
         # the density-free answers need their scale put back
         at = restore(at)
-    stats["converged"] = not out
+    if stats.get("algorithm") != "whole_island_sd_lbfgs":
+        stats["converged"] = not out
     stats["fold_left"] = inside_out(at)
     stats.update(profile)
     return at[:output_V].copy(), stats

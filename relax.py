@@ -71,6 +71,12 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                     "0.1 the packing does not even out -- some faces keep sitting far off the island's "
                     "average density")
 
+    whole_island_solver: bpy.props.EnumProperty(
+        name="Whole Island", items=(('CG', "CG", "Use the established whole-island solver"),
+                                     ('LBFGS', "L-BFGS", "Use L-BFGS when the whole-island chart "
+                                                           "is valid and has no flips")),
+        default='CG')
+
     @classmethod
     def poll(cls, context):
         # Mesh.type reports None while the object is in edit mode, so look for UV layers
@@ -268,6 +274,8 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                 energy_mode="symmetric_dirichlet",
                 cap_holes=not local_mode,
                 local_solver=local_mode,
+                whole_island_solver=(self.whole_island_solver
+                                     if not local_mode else "LBFGS"),
                 **solve_kwargs)
             for key in solver_profile:
                 solver_profile[key] += st.get(key, 0.0)
