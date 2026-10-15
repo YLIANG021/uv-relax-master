@@ -44,13 +44,6 @@ class UVRELAX_PT_preferences(bpy.types.AddonPreferences):
                     "is bought from the faces themselves, which start to look skewed, and under about "
                     "0.1 the packing does not even out -- some faces keep sitting far off the island's "
                     "average density")
-    whole_island_solver: bpy.props.EnumProperty(
-        name="Whole Island",
-        items=(('CG', "CG", "Use the established whole-island solver"),
-               ('LBFGS', "L-BFGS", "Use L-BFGS for a valid, non-folded whole island; fall back "
-                                   "to CG when the chart is unsuitable")),
-        default='CG')
-
     def draw(self, context):
         col = self.layout.column(align=True)
         col.prop(self, "steps")
@@ -72,10 +65,8 @@ class UVRELAX_PT_panel(bpy.types.Panel):
                           text="Relax Selection", icon='UV')
         op.steps = prefs.steps
         op.density_weight = prefs.density_weight
-        op.whole_island_solver = prefs.whole_island_solver
         layout.prop(prefs, "steps", text="Steps", slider=True)
         layout.prop(prefs, "density_weight", text="Density Balance", slider=True)
-        layout.prop(prefs, "whole_island_solver", expand=True)
         box = layout.box()
         select_row = box.row(align=True)
         interior = select_row.operator(selection.UVRELAX_OT_select_region.bl_idname,

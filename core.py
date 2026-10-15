@@ -712,7 +712,8 @@ def _local_symmetric_dirichlet_solve(p, tl, uv0, pin, maxit, density_weight,
                                      majority_orientation=None, boundary_weight=None,
                                      boundary_edges_override=None,
                                      boundary_3d_length_override=None,
-                                     boundary_count_override=None):
+                                     boundary_count_override=None,
+                                     scale_center_override=None):
     """Minimize true symmetric-Dirichlet energy over the free UV coordinates.
 
     Limited-memory BFGS leaves pinned coordinates untouched and rejects trial steps that invert a
@@ -839,17 +840,51 @@ def _local_symmetric_dirichlet_solve(p, tl, uv0, pin, maxit, density_weight,
     cg_t0 = time.perf_counter()
     x = uv0[free_ids].reshape(-1).copy()
     base = uv0.copy()
+    loose = not bool(pin.any())
+    if scale_center_override is not None:
+        scale_center = np.asarray(scale_center_override, dtype=float).reshape(2)
+    elif loose:
+        scale_center = uv0.mean(axis=0)
+    else:
+        pinned_ids = np.flatnonzero(pin)
+        scale_center = (uv0[pinned_ids].mean(axis=0) if len(pinned_ids)
+                        else uv0.mean(axis=0))
+
+    def project_similarity(v, state):
+        """Remove whole-chart similarity motion from free-coordinate vectors."""
+        q = state[free_ids] - scale_center
+        scale = q.copy()
+        if loose:
+            basis = np.stack((
+                np.broadcast_to((1.0, 0.0), q.shape),
+                np.broadcast_to((0.0, 1.0), q.shape),
+                np.stack((-q[:, 1], q[:, 0]), axis=1),
+                q,
+            ), axis=2).reshape(-1, 4)
+        else:
+            basis = scale.reshape(-1, 1)
+        flat_basis = basis
+        if not flat_basis.size:
+            return v
+        orthogonal, singular, _ = np.linalg.svd(flat_basis, full_matrices=False)
+        if not len(singular) or singular[0] <= 1e-30:
+            return v
+        rank = int(np.count_nonzero(singular > singular[0] * 1e-12))
+        if not rank:
+            return v
+        directions = orthogonal[:, :rank]
+        return v - directions @ (directions.T @ v)
+
     history_s = []
     history_y = []
     history_rho = []
     value = start_value
-    gradient = start_gradient[free_ids].reshape(-1)
+    gradient = project_similarity(start_gradient[free_ids].reshape(-1), base)
     initial_norm = float(np.linalg.norm(gradient))
     converged = initial_norm <= 1e-10
     iterations = 0
     max_iterations = max(1, int(maxit))
     memory = 8
-
     for iteration in range(max_iterations):
         grad_norm = float(np.linalg.norm(gradient))
         if grad_norm <= max(1e-7 * initial_norm, 1e-10):
@@ -872,6 +907,7 @@ def _local_symmetric_dirichlet_solve(p, tl, uv0, pin, maxit, density_weight,
             beta = rho * float(np.dot(y_vec, direction))
             direction += s_vec * (alpha - beta)
         direction = -direction
+        direction = project_similarity(direction, base)
         slope = float(np.dot(gradient, direction))
         if not np.isfinite(slope) or slope >= -1e-20:
             history_s.clear()
@@ -897,9 +933,11 @@ def _local_symmetric_dirichlet_solve(p, tl, uv0, pin, maxit, density_weight,
             break
 
         next_base, next_value, next_gradient_uv, next_x = accepted
-        next_gradient = next_gradient_uv[free_ids].reshape(-1)
-        s_vec = next_x - x
+        next_gradient = project_similarity(
+            next_gradient_uv[free_ids].reshape(-1), next_base)
+        s_vec = project_similarity(next_x - x, base)
         y_vec = next_gradient - gradient
+        y_vec = project_similarity(y_vec, base)
         sy = float(np.dot(s_vec, y_vec))
         if sy > 1e-12 * np.linalg.norm(s_vec) * max(np.linalg.norm(y_vec), 1e-30):
             history_s.append(s_vec)
@@ -1030,7 +1068,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             boundary_weight=boundary_weight,
             boundary_edges_override=boundary_edges_override,
             boundary_3d_length_override=boundary_3d_length_override,
-            boundary_count_override=boundary_count_override)
+            boundary_count_override=boundary_count_override,
+            scale_center_override=scale_center_override)
         if local_result is not None:
             return local_result
     virtual_holes = 0
@@ -1150,9 +1189,17 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             boundary_weight=boundary_weight,
             boundary_edges_override=boundary_edges,
             boundary_3d_length_override=boundary_3d_length,
-            boundary_count_override=boundary_count)
+            boundary_count_override=boundary_count,
+            scale_center_override=scale_center_override)
         if lbfgs_result is not None:
             result_uv, result_stats = lbfgs_result
+            # The symmetric-Dirichlet objective is scale-invariant. Preserve the authored
+            # packing size so repeated relax operations do not slowly shrink or grow the island.
+            start_area = float(np.abs(signed_uv_area(uv0[tl])).sum())
+            result_area = float(np.abs(signed_uv_area(result_uv[tl])).sum())
+            if start_area > 1e-30 and result_area > 1e-30:
+                center = result_uv.mean(axis=0)
+                result_uv = center + (result_uv - center) * np.sqrt(start_area / result_area)
             result_stats.update({
                 "algorithm": "whole_island_sd_lbfgs",
                 "free": int((~pin[:output_V]).sum()),
