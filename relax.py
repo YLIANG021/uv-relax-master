@@ -274,7 +274,10 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                 # selection must keep its current UV as the fixed-boundary problem's initial state.
                 reinitialize=(not local_mode and self.axis == 'XY'),
                 energy_mode="symmetric_dirichlet",
-                cap_holes=(not local_mode and self.axis == 'XY'),
+                # Temporary cap faces currently alter the full-island density normalization and
+                # make repeated relax operations oscillate. Keep the stable real-face solve on the
+                # button path until virtual-hole weighting is separated from the real chart.
+                cap_holes=False,
                 local_solver=local_mode,
                 axis=self.axis,
                 **solve_kwargs)
