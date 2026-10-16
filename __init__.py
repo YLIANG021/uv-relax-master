@@ -65,6 +65,9 @@ class UVRELAX_PT_panel(bpy.types.Panel):
                           text="Relax Selection", icon='UV')
         op.steps = prefs.steps
         op.density_weight = prefs.density_weight
+        # Operator properties can retain the last executed value in Blender's UI. Set the
+        # main button explicitly so it always relaxes both UV axes after an X/Y-only action.
+        op.axis = 'XY'
         x_op = row.operator(relax.UVRELAX_OT_relax.bl_idname,
                             text="", icon='EVENT_X')
         x_op.steps = prefs.steps

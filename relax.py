@@ -1,3 +1,4 @@
+import hashlib
 import time
 
 import bpy
@@ -5,6 +6,39 @@ import bmesh
 import numpy as np
 
 from . import core, bridge
+
+
+# A bounded cache for states that were fully settled by the previous operation.  It is keyed by
+# object/settings and stores only a digest of the mesh, selection, and UV state.
+_SETTLED_CACHE = {}
+_SETTLED_CACHE_LIMIT = 8
+
+
+def _state_digest(ob, co, tri, lt, uv, selected, sync, axis, steps, density_weight, uvl):
+    """Return a compact identity for a relax input state."""
+    hasher = hashlib.blake2b(digest_size=20)
+    pointer = ob.as_pointer() if hasattr(ob, "as_pointer") else id(ob)
+    layer_name = str(getattr(uvl, "name", ""))
+    settings = (pointer, layer_name, bool(sync), str(axis).upper(), int(steps),
+                round(float(density_weight), 12))
+    hasher.update(repr(settings).encode("ascii"))
+    for value in (co, tri, lt, uv, selected):
+        array = np.ascontiguousarray(value)
+        hasher.update(repr((array.shape, str(array.dtype))).encode("ascii"))
+        hasher.update(array.tobytes())
+    return settings, hasher.digest()
+
+
+def _settled_cache_hit(state):
+    settings, digest = state
+    return _SETTLED_CACHE.get(settings) == digest
+
+
+def _remember_settled(state):
+    settings, digest = state
+    _SETTLED_CACHE[settings] = digest
+    while len(_SETTLED_CACHE) > _SETTLED_CACHE_LIMIT:
+        _SETTLED_CACHE.pop(next(iter(_SETTLED_CACHE)))
 
 
 def _inside_out(signs):
@@ -113,6 +147,9 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         selection_source = ("UV_CORNERS" if sync_uv_valid else "MESH") if sync else "UV"
         selection = bridge.selection_counts(bm, sync)
         corner_selected = bridge.selected_corners(bm, lt, sync, context.tool_settings)
+        state = _state_digest(
+            context.active_object, co, tri, lt, uvs, corner_selected, sync,
+            self.axis, self.steps, self.density_weight, uvl)
         selected_point_ids = np.unique(inv.ravel()[corner_selected.ravel()])
         selection_present = bool(len(selected_point_ids))
         if not selection_present:
@@ -123,6 +160,12 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                  selection["verts"], selection["edges"], selection["faces"],
                  (time.perf_counter() - t0) * 1000.0))
             self.report({"WARNING"}, "Nothing selected in the UV editor")
+            return {"CANCELLED"}
+        if _settled_cache_hit(state):
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            self.report({"INFO"}, "Nothing relaxed: the current state is already settled")
+            _console_log("CANCEL object=%s reason=settled_cache elapsed_ms=%.1f" %
+                         (context.active_object.name, elapsed_ms))
             return {"CANCELLED"}
         labs = np.unique(point_isl[selected_point_ids])
         scope_face_ids = core.incident_faces(topology, selected_point_ids)
@@ -156,6 +199,7 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         solver_profile = {"model_ms": 0.0, "preconditioner_ms": 0.0,
                           "cg_ms": 0.0, "line_search_ms": 0.0}
         solver_algorithms = set()
+        settled_all = True
         reduced_islands = 0
         reduced_faces = 0
         reduced_points = 0
@@ -283,6 +327,7 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                 **solve_kwargs)
             for key in solver_profile:
                 solver_profile[key] += st.get(key, 0.0)
+            settled_all = settled_all and bool(st.get("converged", True))
             solver_algorithms.add(st.get("algorithm", "unknown"))
             reinitialized_islands += int(st.get("reinitialized", False))
             capped_holes += int(st.get("capped_holes", 0))
@@ -325,6 +370,9 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             solves = max(solves, st["solve"])
 
         if relaxed == 0:
+            if (len(labs) and even == len(labs) and not stuck and not declined
+                    and not ran_out and not mirrored):
+                _remember_settled(state)
             why = []
             if even:
                 why.append("%d point(s) on %d island(s) already keep their shape as well as "
@@ -429,6 +477,11 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             tail += " | %d face pair(s) now lie on top of a neighbouring island because a border " \
                     "that moved took the room -- repack the UVs" % across
         post_ms = (time.perf_counter() - post_t0) * 1000.0
+        if (relaxed and settled_all and not (stuck or declined or ran_out or mirrored
+                                              or within or across)):
+            _remember_settled(_state_digest(
+                context.active_object, co, tri, lt, new_loop_uv, corner_selected, sync,
+                self.axis, self.steps, self.density_weight, uvl))
         ms = (time.perf_counter() - t0) * 1000.0
         _console_log(
             "DONE object=%s elapsed_ms=%.1f read_ms=%.1f setup_ms=%.1f "
