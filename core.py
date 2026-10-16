@@ -1448,9 +1448,16 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             e += float((boundary_weights * boundary_error(u) ** 2).sum())
         return e
 
-    def objective(A, w, signs, u, dens):
-        """Evaluate the current IRLS objective, including its symmetric-Dirichlet weights."""
-        return energy(A, w * sd_scale(u), signs, u, dens)
+    def objective(A, w, signs, u, dens, scale=None):
+        """Evaluate the IRLS objective with either a fixed or state-derived face scale.
+
+        A line search must compare every candidate under the same quadratic majorizer. Recomputing
+        ``sd_scale`` for each candidate changes the objective while searching and can accept a move
+        that is worse under the model that produced its direction. The default remains useful for
+        ranking completed states; iterative acceptance passes the scale used to build that model.
+        """
+        weights = sd_scale(u) if scale is None else scale
+        return energy(A, w * weights, signs, u, dens)
 
     def inverted(u):
         """Faces of the island lying the way round the majority is not, in the state u."""
@@ -1687,7 +1694,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             current = base_at
             loops = 3 if symmetric_dirichlet else 1
             for _ in range(loops):
-                local_w = w * sd_scale(current)
+                local_scale = sd_scale(current)
+                local_w = w * local_scale
                 cand, iters, hit, direction = solve(
                     A, local_w, signs, clamp_at, current, dens)
                 note(iters, hit)
@@ -1695,14 +1703,15 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                     break
                 search_t0 = time.perf_counter()
                 old_fold = inside_out(current)
-                old_energy = objective(A, w, signs, current, dens)
+                old_energy = objective(A, w, signs, current, dens, scale=local_scale)
                 accepted = None
                 for fraction in (1.0, 0.5, 0.25, 0.125, 0.0625):
                     trial = current + fraction * direction
                     if loose:
                         trial = restore(trial)
                     if (inside_out(trial) <= old_fold and
-                            objective(A, w, signs, trial, dens) <= old_energy + 1e-12 * max(old_energy, 1.0)):
+                            objective(A, w, signs, trial, dens, scale=local_scale)
+                            <= old_energy + 1e-12 * max(old_energy, 1.0)):
                         accepted = trial
                         break
                 profile["line_search_ms"] += (time.perf_counter() - search_t0) * 1000.0
@@ -1731,7 +1740,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             the linearization reached, and a round costs one conjugate-gradient solve."""
             base = base_at
             for _ in range(density_refine):
-                local_w = w * sd_scale(base)
+                local_scale = sd_scale(base)
+                local_w = w * local_scale
                 model = system(A, local_w, signs, base, True)
                 value = model[3]
                 cand, iters, hit, x = solve(
@@ -1740,7 +1750,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 if iters == 0:
                     break
                 line_search_t0 = time.perf_counter()
-                e_last = objective(A, w, signs, base, True)
+                e_last = objective(A, w, signs, base, True, scale=local_scale)
                 # m(t) = e_last + a t + b t^2 along the ray, read off the model at t = 1/2 and t = 1
                 slope = 4.0 * (value(base + 0.5 * x) - e_last) - (value(cand) - e_last)
                 fold_last = inside_out(base)
@@ -1750,7 +1760,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                     if loose:
                         u = restore(u)
                     if (inside_out(u) <= fold_last
-                            and objective(A, w, signs, u, True) <= e_last + 0.1 * t * slope):
+                            and objective(A, w, signs, u, True, scale=local_scale)
+                            <= e_last + 0.1 * t * slope):
                         moved = u - base
                         base = u
                         keep(base)
