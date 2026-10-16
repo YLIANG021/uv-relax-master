@@ -1379,8 +1379,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
 
         def hvp(v):
             face_v = v[tl]
-            d = np.einsum("tkcv,tcv->tk", A, face_v)
-            gs = np.einsum("tkcv,tk->tcv", A, d) * (2.0 * w)[:, None, None]
+            d = np.einsum("tkcv,tcv->tk", weighted_A, face_v)
+            gs = np.einsum("tkcv,tk->tcv", weighted_A, d)
             if lin is None:
                 out = scatter(gs)
             else:
@@ -1394,11 +1394,13 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
 
         cache_key = (id(A), id(w))
         if cache_key not in conformal_cache:
-            conformal_blocks = 2.0 * w[:, None, None, None] * np.einsum(
-                "tkci,tkcj->tcij", A, A)
+            weighted_A = A * np.sqrt(2.0 * w)[:, None, None, None]
+            conformal_blocks = np.einsum(
+                "tkci,tkcj->tcij", weighted_A, weighted_A)
             conformal_cache[cache_key] = (
-                conformal_blocks, np.diagonal(conformal_blocks, axis1=2, axis2=3))
-        conformal_blocks, conformal_diag = conformal_cache[cache_key]
+                weighted_A, conformal_blocks,
+                np.diagonal(conformal_blocks, axis1=2, axis2=3))
+        weighted_A, conformal_blocks, conformal_diag = conformal_cache[cache_key]
         face_blocks = conformal_blocks.copy() if dens else conformal_blocks
         dg = conformal_diag.copy() if dens else conformal_diag
         c0 = np.zeros((V, 2))
