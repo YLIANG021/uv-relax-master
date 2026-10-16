@@ -65,6 +65,16 @@ class UVRELAX_PT_panel(bpy.types.Panel):
                           text="Relax Selection", icon='UV')
         op.steps = prefs.steps
         op.density_weight = prefs.density_weight
+        x_op = row.operator(relax.UVRELAX_OT_relax.bl_idname,
+                            text="", icon='EVENT_X')
+        x_op.steps = prefs.steps
+        x_op.density_weight = prefs.density_weight
+        x_op.axis = 'X'
+        y_op = row.operator(relax.UVRELAX_OT_relax.bl_idname,
+                            text="", icon='EVENT_Y')
+        y_op.steps = prefs.steps
+        y_op.density_weight = prefs.density_weight
+        y_op.axis = 'Y'
         layout.prop(prefs, "steps", text="Steps", slider=True)
         layout.prop(prefs, "density_weight", text="Density Balance", slider=True)
         box = layout.box()

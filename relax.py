@@ -71,6 +71,14 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                     "0.1 the packing does not even out -- some faces keep sitting far off the island's "
                     "average density")
 
+    axis: bpy.props.EnumProperty(
+        name="Relax Axis",
+        items=(('XY', "XY", "Relax both UV axes"),
+               ('X', "X", "Relax only the horizontal UV coordinate"),
+               ('Y', "Y", "Relax only the vertical UV coordinate")),
+        default='XY',
+        options={'HIDDEN'})
+
     @classmethod
     def poll(cls, context):
         # Mesh.type reports None while the object is in edit mode, so look for UV layers
@@ -264,10 +272,11 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                 boundary_weight=None,
                 # A complete island can be safely re-charted from its 3D geometry.  A partial
                 # selection must keep its current UV as the fixed-boundary problem's initial state.
-                reinitialize=not local_mode,
+                reinitialize=(not local_mode and self.axis == 'XY'),
                 energy_mode="symmetric_dirichlet",
-                cap_holes=not local_mode,
+                cap_holes=(not local_mode and self.axis == 'XY'),
                 local_solver=local_mode,
+                axis=self.axis,
                 **solve_kwargs)
             for key in solver_profile:
                 solver_profile[key] += st.get(key, 0.0)
@@ -363,6 +372,7 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             overlap_cache=overlap_cache)
         pos, overlap_fix = core.untangle_overlaps(
             inv, pos, movable_uv, isl, moved_faces=moved_faces,
+            axis=self.axis,
             initial=overlap_initial, overlap_cache=overlap_cache)
         overlap_fix_ms = (time.perf_counter() - overlap_fix_t0) * 1000.0
         write_t0 = time.perf_counter()

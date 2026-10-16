@@ -713,6 +713,7 @@ def _local_symmetric_dirichlet_solve(p, tl, uv0, pin, maxit, density_weight,
                                      boundary_edges_override=None,
                                      boundary_3d_length_override=None,
                                      boundary_count_override=None,
+                                     axis="XY",
                                      scale_center_override=None):
     """Minimize true symmetric-Dirichlet energy over the free UV coordinates.
 
@@ -726,6 +727,8 @@ def _local_symmetric_dirichlet_solve(p, tl, uv0, pin, maxit, density_weight,
     point_count = len(uv0)
     face_count = len(tl)
     free_ids = np.flatnonzero(~pin)
+    axis_mode = str(axis).upper()
+    axis_index = 0 if axis_mode == "X" else 1 if axis_mode == "Y" else None
     profile = {"model_ms": 0.0, "preconditioner_ms": 0.0,
                "cg_ms": 0.0, "line_search_ms": 0.0}
     if not len(free_ids) or not face_count:
@@ -852,6 +855,19 @@ def _local_symmetric_dirichlet_solve(p, tl, uv0, pin, maxit, density_weight,
 
     def project_similarity(v, state):
         """Remove whole-chart similarity motion from free-coordinate vectors."""
+        values = np.asarray(v, dtype=float).reshape(-1, 2).copy()
+        if axis_index is not None:
+            values[:, 1 - axis_index] = 0.0
+            if loose:
+                values[:, axis_index] -= values[:, axis_index].mean()
+            q_axis = state[free_ids, axis_index] - scale_center[axis_index]
+            if loose:
+                q_axis = q_axis - q_axis.mean()
+            denom = float(np.dot(q_axis, q_axis))
+            if denom > 1e-30:
+                values[:, axis_index] -= q_axis * (
+                    float(np.dot(q_axis, values[:, axis_index])) / denom)
+            return values.reshape(-1)
         q = state[free_ids] - scale_center
         scale = q.copy()
         if loose:
@@ -985,7 +1001,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 boundary_3d_length_override=None, boundary_count_override=None,
                 scale_center_override=None, reinitialize=False,
                 energy_mode="conformal", cap_holes=False, local_solver=False,
-                whole_island_solver="CG"):
+                whole_island_solver="CG", axis="XY"):
     """Bring one island to the evenest shape its boundary allows -- by solving for it.
 
     The conformal part of the energy this relaxes is a quadratic form in the UV coordinates:
@@ -1059,6 +1075,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
     V = output_V
     uv0 = np.asarray(uv0, dtype=float).copy()
     pin = np.asarray(pin, dtype=bool).copy()
+    axis_mode = str(axis).upper()
+    axis_index = 0 if axis_mode == "X" else 1 if axis_mode == "Y" else None
     if local_solver and not reinitialize and not cap_holes:
         local_result = _local_symmetric_dirichlet_solve(
             p, tl, uv0, pin, maxit=maxit, density_weight=density_weight,
@@ -1069,6 +1087,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             boundary_edges_override=boundary_edges_override,
             boundary_3d_length_override=boundary_3d_length_override,
             boundary_count_override=boundary_count_override,
+                axis=axis,
             scale_center_override=scale_center_override)
         if local_result is not None:
             return local_result
@@ -1190,6 +1209,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             boundary_edges_override=boundary_edges,
             boundary_3d_length_override=boundary_3d_length,
             boundary_count_override=boundary_count,
+                axis=axis,
             scale_center_override=scale_center_override)
         if lbfgs_result is not None:
             result_uv, result_stats = lbfgs_result
@@ -1450,12 +1470,17 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
     if loose:
         cen = uv0.mean(0)
         q = uv0 - cen
-        gauge = np.stack([
-            np.broadcast_to(np.array([1.0, 0.0]), (V, 2)),
-            np.broadcast_to(np.array([0.0, 1.0]), (V, 2)),
-            np.stack([-q[:, 1], q[:, 0]], axis=1),
-            q,
-        ], axis=2)
+        if axis_index is None:
+            gauge = np.stack([
+                np.broadcast_to(np.array([1.0, 0.0]), (V, 2)),
+                np.broadcast_to(np.array([0.0, 1.0]), (V, 2)),
+                np.stack([-q[:, 1], q[:, 0]], axis=1),
+                q,
+            ], axis=2)
+        else:
+            gauge = np.zeros((V, 2, 2), dtype=float)
+            gauge[:, axis_index, 0] = 1.0
+            gauge[:, axis_index, 1] = q[:, axis_index]
     else:
         # A partial solve has real Dirichlet points, so translation and rotation are already
         # determined.  Its remaining failure mode is a uniform contraction of the free region
@@ -1463,7 +1488,11 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         # unconstrained.
         scale_center = uv0.mean(0) if scale_center_override is None else np.asarray(
             scale_center_override, dtype=float)
-        scale_gauge = (uv0 - scale_center)[:, :, None]
+        if axis_index is None:
+            scale_gauge = (uv0 - scale_center)[:, :, None]
+        else:
+            scale_gauge = np.zeros((V, 2, 1), dtype=float)
+            scale_gauge[:, axis_index, 0] = uv0[:, axis_index] - scale_center[axis_index]
     # which points may move is worked out once, before any solve, and shared by both questions below:
     # a point no live triangle sits on has no stiffness and nothing to be even about
     _, stiff, _, _, _ = system(*ask(maj), uv0, False)
@@ -1485,6 +1514,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         """Put the island's packing back at the area it started with, about its own centre.  The
         energy is as small for a shrunken island as for an even one, and with nothing held there is
         nothing else to settle its scale.  A uniform positive scaling turns no face over."""
+        if axis_index is not None:
+            return v
         now = float(np.abs(signed_uv_area(v[tl])).sum())
         if now <= 1e-18:
             return v
@@ -1526,11 +1557,14 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
 
         def project(v):
             if projector is None:
-                return v * live
-            out = np.zeros_like(v)
-            flat = v[active_ids].reshape(-1)
-            if len(flat):
-                out[active_ids] = (flat - projector @ (projector.T @ flat)).reshape(-1, 2)
+                out = v * live
+            else:
+                out = np.zeros_like(v)
+                flat = v[active_ids].reshape(-1)
+                if len(flat):
+                    out[active_ids] = (flat - projector @ (projector.T @ flat)).reshape(-1, 2)
+            if axis_index is not None:
+                out[:, 1 - axis_index] = 0.0
             return out
 
         inv_diag = live / np.maximum(diag, 1e-30)
@@ -1642,6 +1676,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             if best[0] is None or key < best[0][0]:
                 best[0] = (key, cand, count[0], count[1], count[2])
             return key
+
+        keep(uv0)
 
         def step(clamp_at, base_at, dens):
             # Symmetric Dirichlet is handled as a short global/local IRLS loop.  The local step
@@ -1855,7 +1891,8 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
 
     Face boxes and SAT axes stay cached between overlap rounds. Dense movement uses a vectorized
     x-sweep; sparse movement sweeps the moving faces and checks them against the stationary boxes.
-    Both paths feed the same SAT test in blocks.
+    Both paths enumerate all candidates and feed the same SAT test in bounded blocks. `window` is
+    retained for call compatibility but no longer limits the search.
 
     tl: (T,3) point ids, u: (V,2) their UV coordinates, lab: (T,) island label per face, or None to
     compare every face in the batch with every other.  `moved`: (T,) bool, which faces this relax was
@@ -1892,68 +1929,77 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
     face_labels = face_labels_all[f]
     mv = None if moved_all is None else moved_all[f]
 
-    def sweep_candidates(indices):
-        """Build the bounded x-sweep for a compact set of valid faces."""
+    pair_block = max(1, int(block))
+
+    def sweep_candidate_batches(indices):
+        """Yield complete x-overlap candidate ranges without retaining all pairs at once."""
         if len(indices) < 2:
-            return np.zeros(0, np.int64), np.zeros(0, np.int64)
+            return
         order = indices[np.argsort(box[indices, 0, 0])]
         left = box[order, 0, 0]
         ends = np.searchsorted(left, box[order, 1, 0], side="right")
-        counts = np.clip(ends - np.arange(len(indices)) - 1, 0, window)
-        total = int(counts.sum())
-        if total == 0:
-            return np.zeros(0, np.int64), np.zeros(0, np.int64)
-        starts = np.cumsum(counts) - counts
-        ii = np.repeat(np.arange(len(indices)), counts)
-        jj = ii + 1 + (np.arange(total) - np.repeat(starts, counts))
-        return order[ii], order[jj]
+        counts = np.maximum(ends - np.arange(len(indices)) - 1, 0)
+        prefix = np.cumsum(counts)
+        total = int(prefix[-1])
+        for offset in range(0, total, pair_block):
+            flat = np.arange(offset, min(offset + pair_block, total))
+            owner = np.searchsorted(prefix, flat, side="right")
+            previous = np.where(owner > 0, prefix[np.maximum(owner - 1, 0)], 0)
+            within = flat - previous
+            yield order[owner], order[owner + 1 + within]
 
-    candidate_t0 = time.perf_counter()
-    # The all-face query is a single vectorized operation and wins once movement is dense.
+    # The all-face query wins once movement is dense. Candidate batches bound temporary memory,
+    # while the x-sweep enumerates every possible pair instead of clipping each face to a window.
     dense = mv is None or int(mv.sum()) >= max(2, n // 2)
     overlap_cache["candidate_mode"] = "dense" if dense else "sparse"
-    if dense:
-        a, b = sweep_candidates(np.arange(n, dtype=np.int64))
-    else:
+
+    def candidate_batches():
+        if dense:
+            yield from sweep_candidate_batches(np.arange(n, dtype=np.int64))
+            return
         moving = np.flatnonzero(mv)
         stationary = np.flatnonzero(~mv)
-        aa, bb = sweep_candidates(moving)
-        cross = []
-        if len(stationary):
-            static_order = stationary[np.argsort(box[stationary, 0, 0])]
-            static_left = box[static_order, 0, 0]
-            for face in moving.tolist():
-                start = int(np.searchsorted(static_left, box[face, 0, 0], side="left"))
-                end = int(np.searchsorted(static_left, box[face, 1, 0], side="right"))
-                lo = max(0, start - window)
-                cand = static_order[lo:min(end, lo + window)]
+        yield from sweep_candidate_batches(moving)
+        if not len(stationary):
+            return
+        static_order = stationary[np.argsort(box[stationary, 0, 0])]
+        static_left = box[static_order, 0, 0]
+        interval_block = 256
+        static_right = box[static_order, 1, 0]
+        static_block_starts = np.arange(0, len(static_order), interval_block)
+        static_block_max = np.maximum.reduceat(static_right, static_block_starts)
+        for face in moving:
+            end = int(np.searchsorted(static_left, box[face, 1, 0], side="right"))
+            min_x = box[face, 0, 0]
+            full_blocks = end // interval_block
+            block_ids = np.flatnonzero(static_block_max[:full_blocks] > min_x)
+            candidate_chunks = []
+            for block_id in block_ids:
+                first = int(block_id) * interval_block
+                cand = static_order[first:first + interval_block]
+                cand = cand[static_right[first:first + interval_block] > min_x]
                 if len(cand):
-                    cand = cand[box[cand, 1, 0] > box[face, 0, 0]]
+                    candidate_chunks.append(cand)
+            tail = full_blocks * interval_block
+            if tail < end:
+                cand = static_order[tail:end]
+                cand = cand[static_right[tail:end] > min_x]
                 if len(cand):
-                    cross.append(np.stack([np.full(len(cand), face, np.int64), cand], 1))
-        if cross:
-            cross = np.concatenate(cross, axis=0)
-            a = np.concatenate([aa, cross[:, 0]])
-            b = np.concatenate([bb, cross[:, 1]])
-        else:
-            a, b = aa, bb
-    if len(a) == 0:
-        overlap_cache["candidate_ms"] += (time.perf_counter() - candidate_t0) * 1000.0
-        empty = np.zeros((0, 2), np.int64)
-        return (0, 0, empty) if return_pairs else (0, 0)
-    sel = ((box[a, 1, 1] > box[b, 0, 1])
-           & (box[b, 1, 1] > box[a, 0, 1]))
-    a, b = a[sel], b[sel]
-    same = face_labels[a] == face_labels[b]
-    overlap_cache["candidate_ms"] += (time.perf_counter() - candidate_t0) * 1000.0
-    overlap_cache["candidate_count"] += float(len(a))
+                    candidate_chunks.append(cand)
+            if candidate_chunks:
+                candidates = np.concatenate(candidate_chunks)
+                for first in range(0, len(candidates), pair_block):
+                    cand = candidates[first:first + pair_block]
+                    yield np.full(len(cand), face, np.int64), cand
 
-    def narrow(ii):
+    t = u[tl[f]]
+
+    def narrow(a, b):
         """Return the indices of overlapping candidates after the separating-axis test."""
         hit_blocks = []
-        for s in range(0, len(ii), block):
-            batch = ii[s:s + block]
-            pa, pb = a[batch], b[batch]
+        for s in range(0, len(a), pair_block):
+            end = min(s + pair_block, len(a))
+            pa, pb = a[s:end], b[s:end]
             ta, tb = t[pa], t[pb]
             # Any separating axis rejects the pair. Check A's three axes first so rejected
             # candidates never allocate projections onto B's axes.
@@ -1968,41 +2014,73 @@ def overlapping_pairs(tl, u, lab=None, moved=None, window=200, block=65536,
             hit = (gap > slack).all(1)
             if not hit.any():
                 continue
-            batch = batch[hit]
-            ax = edge_normals[pb[hit]]
-            ga = np.einsum("pnc,pkc->pnk", ta[hit], ax)
-            gb = np.einsum("pnc,pkc->pnk", tb[hit], ax)
+            hit_ids = np.flatnonzero(hit)
+            pa, pb = pa[hit], pb[hit]
+            ta, tb = ta[hit], tb[hit]
+            ax = edge_normals[pb]
+            ga = np.einsum("pnc,pkc->pnk", ta, ax)
+            gb = np.einsum("pnc,pkc->pnk", tb, ax)
             gap = np.minimum(ga.max(1), gb.max(1)) - np.maximum(ga.min(1), gb.min(1))
-            hit_b = (gap > slack[hit]).all(1)
+            hit_b = (gap > slack[hit_ids]).all(1)
             if hit_b.any():
-                hit_blocks.append(batch[hit_b])
+                hit_blocks.append(s + hit_ids[hit_b])
         return (np.concatenate(hit_blocks) if hit_blocks
                 else np.zeros(0, np.int64))
 
-    # The SAT projection is independent of the island-label split. Process candidates together,
-    # then split the surviving indices into within-island and across-island results.
-    sat_candidates = (np.arange(len(a), dtype=np.int64) if mv is not None
-                      else np.flatnonzero(same))
-    sat_t0 = time.perf_counter()
-    t = u[tl[f]]
-    hit_idx = narrow(sat_candidates)
-    overlap_cache["sat_ms"] += (time.perf_counter() - sat_t0) * 1000.0
-    same_hit = same[hit_idx]
-    same_idx = hit_idx[same_hit]
-    across_idx = hit_idx[~same_hit] if mv is not None else np.zeros(0, np.int64)
-    same_count = int(same_hit.sum())
-    across_count = int((~same_hit).sum()) if mv is not None else 0
+    candidate_t0 = time.perf_counter()
+    candidate_count = 0
+    same_count = 0
+    across_count = 0
+    same_pair_blocks = []
+    across_pair_blocks = []
+    sat_ms = 0.0
+    for a, b in candidate_batches():
+        keep = ((box[a, 1, 1] > box[b, 0, 1])
+                & (box[b, 1, 1] > box[a, 0, 1]))
+        a, b = a[keep], b[keep]
+        if not len(a):
+            continue
+        same = face_labels[a] == face_labels[b]
+        if mv is None:
+            a, b = a[same], b[same]
+            same = np.ones(len(a), dtype=bool)
+        else:
+            moved_pair = mv[a] | mv[b]
+            a, b, same = a[moved_pair], b[moved_pair], same[moved_pair]
+        candidate_count += len(a)
+        if not len(a):
+            continue
+        sat_t0 = time.perf_counter()
+        hit_ids = narrow(a, b)
+        sat_ms += (time.perf_counter() - sat_t0) * 1000.0
+        if not len(hit_ids):
+            continue
+        same_hit = same[hit_ids]
+        same_count += int(same_hit.sum())
+        across_count += int((~same_hit).sum()) if mv is not None else 0
+        if return_pairs:
+            if same_hit.any():
+                same_pair_blocks.append(np.stack([
+                    f[a[hit_ids[same_hit]]], f[b[hit_ids[same_hit]]]], axis=1))
+            across_hit = ~same_hit if mv is not None else np.zeros(len(same_hit), bool)
+            if across_hit.any():
+                across_pair_blocks.append(np.stack([
+                    f[a[hit_ids[across_hit]]], f[b[hit_ids[across_hit]]]], axis=1))
+    elapsed_ms = (time.perf_counter() - candidate_t0) * 1000.0
+    overlap_cache["candidate_ms"] += max(0.0, elapsed_ms - sat_ms)
+    overlap_cache["sat_ms"] += sat_ms
+    overlap_cache["candidate_count"] += float(candidate_count)
     if return_pairs:
-        same_pairs = np.stack([f[a[same_idx]], f[b[same_idx]]], axis=1) \
-            if len(same_idx) else np.zeros((0, 2), np.int64)
-        across_pairs = np.stack([f[a[across_idx]], f[b[across_idx]]], axis=1) \
-            if len(across_idx) else np.zeros((0, 2), np.int64)
+        same_pairs = (np.concatenate(same_pair_blocks, axis=0) if same_pair_blocks
+                      else np.zeros((0, 2), np.int64))
+        across_pairs = (np.concatenate(across_pair_blocks, axis=0) if across_pair_blocks
+                        else np.zeros((0, 2), np.int64))
         return same_count, across_count, np.concatenate([same_pairs, across_pairs])
     return same_count, across_count
 
 
 def untangle_overlaps(tl, u, movable, lab=None, max_rounds=6,
-                     moved_faces=None, initial=None, overlap_cache=None):
+                     axis="XY", moved_faces=None, initial=None, overlap_cache=None):
     """Apply small, flip-safe separating-axis corrections to detected face overlaps.
 
     Only vertices marked movable receive translation. A correction is retained only if the
@@ -2010,6 +2088,8 @@ def untangle_overlaps(tl, u, movable, lab=None, max_rounds=6,
     cleanup stage, not a replacement for the main shape solve.
     """
     out = np.asarray(u, dtype=float).copy()
+    axis_mode = str(axis).upper()
+    axis_index = 0 if axis_mode == "X" else 1 if axis_mode == "Y" else None
     movable = np.asarray(movable, dtype=bool)
     if moved_faces is None:
         moved_faces = np.any(movable[tl], axis=1)
@@ -2057,6 +2137,12 @@ def untangle_overlaps(tl, u, movable, lab=None, max_rounds=6,
         pair_id = np.arange(len(pairs))
         current_cost = float(depth[pair_id, axis_id].sum())
         axis = axes[np.arange(len(pairs)), axis_id]
+        if axis_index is not None:
+            axis[:, 1 - axis_index] = 0.0
+            lengths = np.linalg.norm(axis, axis=1)
+            valid_axis = lengths > 1e-30
+            axis[valid_axis] /= lengths[valid_axis, None]
+            axis[~valid_axis] = 0.0
         axis[~direction_a[pair_id, axis_id]] *= -1.0
 
         delta = np.zeros_like(out)

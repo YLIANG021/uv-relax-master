@@ -12,8 +12,8 @@ def read(bm):
     """(co, tri, lt, uv, loops, uvl, poly_of_tri) of a live edit mesh.
 
     co is indexed by vertex index, uv by loop position; tri holds vertex indices and
-    lt the matching loop positions, n-gons fan-triangulated.  loops is the BMLoop list
-    uv rows belong to, so write() can put results back.
+    lt the matching loop positions, n-gons use Blender's polygon tessellator.
+    loops is the BMLoop list UV rows belong to, so write() can put results back.
     """
     uvl = bm.loops.layers.uv.active
     if uvl is None:
@@ -28,16 +28,24 @@ def read(bm):
     tri = []
     lt = []
     counts = []
+    from mathutils.geometry import tessellate_polygon
+
     for f in bm.faces:
         fl = f.loops[:]
         base = len(loops)
         loops.extend(fl)
         vs = [crn.vert.index for crn in fl]
-        n = len(fl) - 2
-        for i in range(1, n + 1):
-            tri.append((vs[0], vs[i], vs[i + 1]))
-            lt.append((base, base + i, base + i + 1))
-        counts.append(n)
+        if len(fl) == 3:
+            triangles = [(0, 1, 2)]
+        else:
+            points = [crn.vert.co.copy() for crn in fl]
+            triangles = tessellate_polygon([points])
+            if not triangles:
+                triangles = [(0, i, i + 1) for i in range(1, len(fl) - 1)]
+        for corners in triangles:
+            tri.append(tuple(vs[i] for i in corners))
+            lt.append(tuple(base + i for i in corners))
+        counts.append(len(triangles))
     if not tri:
         return None
 
