@@ -1358,6 +1358,10 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         return L, np.einsum("eij,eij->e", L, base[boundary_edges]) - err
 
     conformal_cache = {}
+    # Stop refinement only after both the UV displacement and the true objective improvement
+    # are small.  A minimum of two rounds below keeps the first correction from being truncated.
+    progress_move_tol = 1e-4
+    progress_energy_tol = 1e-4
 
     def system(A, w, signs, base, dens, boundary_factor=1.0):
         """The quadratic that stands in for the objective at `base`: Hessian-times-vector, the
@@ -1693,7 +1697,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             # polishing below already re-expands the model at the accepted state.
             current = base_at
             loops = 3 if symmetric_dirichlet else 1
-            for _ in range(loops):
+            stalled_rounds = 0
+            for round_index in range(loops):
                 local_scale = sd_scale(current)
                 local_w = w * local_scale
                 cand, iters, hit, direction = solve(
@@ -1705,21 +1710,35 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 old_fold = inside_out(current)
                 old_energy = objective(A, w, signs, current, dens, scale=local_scale)
                 accepted = None
+                accepted_energy = None
                 for fraction in (1.0, 0.5, 0.25, 0.125, 0.0625):
                     trial = current + fraction * direction
                     if loose:
                         trial = restore(trial)
-                    if (inside_out(trial) <= old_fold and
-                            objective(A, w, signs, trial, dens, scale=local_scale)
-                            <= old_energy + 1e-12 * max(old_energy, 1.0)):
+                    if inside_out(trial) <= old_fold:
+                        trial_energy = objective(A, w, signs, trial, dens, scale=local_scale)
+                    else:
+                        trial_energy = None
+                    if (trial_energy is not None
+                            and trial_energy <= old_energy + 1e-12 * max(old_energy, 1.0)):
                         accepted = trial
+                        accepted_energy = trial_energy
                         break
                 profile["line_search_ms"] += (time.perf_counter() - search_t0) * 1000.0
                 if accepted is None:
                     break
                 current = accepted
                 keep(current)
-                if float(np.abs(fraction * direction).max()) <= 1e-7 * spread:
+                move = float(np.abs(fraction * direction).max())
+                relative_move = move / max(spread, 1e-30)
+                relative_drop = max(old_energy - accepted_energy, 0.0) / max(
+                    abs(old_energy), 1.0)
+                if (relative_move <= progress_move_tol
+                        and relative_drop <= progress_energy_tol):
+                    stalled_rounds += 1
+                else:
+                    stalled_rounds = 0
+                if round_index >= 1 and stalled_rounds >= 2:
                     break
             return current
 
@@ -1739,7 +1758,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             rather than a speed one.  Descent is then guaranteed by construction rather than by hoping
             the linearization reached, and a round costs one conjugate-gradient solve."""
             base = base_at
-            for _ in range(density_refine):
+            stalled_rounds = 0
+            for round_index in range(density_refine):
                 local_scale = sd_scale(base)
                 local_w = w * local_scale
                 model = system(A, local_w, signs, base, True)
@@ -1755,19 +1775,33 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 slope = 4.0 * (value(base + 0.5 * x) - e_last) - (value(cand) - e_last)
                 fold_last = inside_out(base)
                 moved = None
+                accepted_value = None
                 for t in (1.0, 0.5, 0.25, 0.125, 0.0625):
                     u = base + t * x
                     if loose:
                         u = restore(u)
-                    if (inside_out(u) <= fold_last
-                            and objective(A, w, signs, u, True, scale=local_scale)
-                            <= e_last + 0.1 * t * slope):
+                    if inside_out(u) <= fold_last:
+                        trial_value = objective(A, w, signs, u, True, scale=local_scale)
+                    else:
+                        trial_value = None
+                    if (trial_value is not None
+                            and trial_value <= e_last + 0.1 * t * slope):
                         moved = u - base
                         base = u
+                        accepted_value = trial_value
                         keep(base)
                         break
                 profile["line_search_ms"] += (time.perf_counter() - line_search_t0) * 1000.0
-                if moved is None or float(np.abs(moved).max()) <= 1e-7 * spread:
+                if moved is None:
+                    break
+                relative_move = float(np.abs(moved).max()) / max(spread, 1e-30)
+                relative_drop = max(e_last - accepted_value, 0.0) / max(abs(e_last), 1.0)
+                if (relative_move <= progress_move_tol
+                        and relative_drop <= progress_energy_tol):
+                    stalled_rounds += 1
+                else:
+                    stalled_rounds = 0
+                if round_index >= 1 and stalled_rounds >= 2:
                     break
             return base
 
