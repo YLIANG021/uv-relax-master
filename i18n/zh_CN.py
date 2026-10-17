@@ -1,5 +1,7 @@
 TRANSLATIONS = {
     ('*', 'UV Relax'): 'UV 松弛',
+    ('*', 'Relax'): '松弛',
+    ('*', 'Selection & Alignment'): '选择和对齐',
     ('*', 'Controller'): '控制器',
     ('*', 'Transform'): '变换',
     ('*', 'Relax Selection'): '松弛所选 UV',

@@ -1,5 +1,6 @@
 TRANSLATIONS = {
-    ('*', 'UV Relax'): 'Расслабление UV', ('*', 'Controller'): 'Управление',
+    ('*', 'UV Relax'): 'Расслабление UV', ('*', 'Relax'): 'Расслабление',
+    ('*', 'Selection & Alignment'): 'Выделение и выравнивание', ('*', 'Controller'): 'Управление',
     ('*', 'Transform'): 'Трансформация', ('*', 'Relax Selection'): 'Расслабить выделение',
     ('*', 'Density Overlay'): 'Наложение плотности', ('*', 'Select Interior'): 'Выбрать внутренние точки',
     ('*', 'Select Boundary'): 'Выбрать границу', ('*', 'Align UV Points'): 'Выровнять UV-точки',

@@ -1,5 +1,6 @@
 TRANSLATIONS = {
-    ('*', 'UV Relax'): 'Làm giãn UV', ('*', 'Controller'): 'Điều khiển',
+    ('*', 'UV Relax'): 'Làm giãn UV', ('*', 'Relax'): 'Làm giãn',
+    ('*', 'Selection & Alignment'): 'Chọn và căn chỉnh', ('*', 'Controller'): 'Điều khiển',
     ('*', 'Transform'): 'Biến đổi', ('*', 'Relax Selection'): 'Làm giãn phần chọn',
     ('*', 'Density Overlay'): 'Lớp phủ mật độ', ('*', 'Select Interior'): 'Chọn phần bên trong',
     ('*', 'Select Boundary'): 'Chọn đường biên', ('*', 'Align UV Points'): 'Căn chỉnh điểm UV',

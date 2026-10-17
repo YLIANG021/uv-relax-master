@@ -1,5 +1,6 @@
 TRANSLATIONS = {
-    ('*', 'UV Relax'): 'UV 鬆弛', ('*', 'Controller'): '控制器',
+    ('*', 'UV Relax'): 'UV 鬆弛', ('*', 'Relax'): '鬆弛',
+    ('*', 'Selection & Alignment'): '選取與對齊', ('*', 'Controller'): '控制器',
     ('*', 'Transform'): '變換', ('*', 'Relax Selection'): '鬆弛所選 UV',
     ('*', 'Density Overlay'): '密度疊加', ('*', 'Select Interior'): '選取內部',
     ('*', 'Select Boundary'): '選取外邊界', ('*', 'Align UV Points'): '對齊 UV 點',

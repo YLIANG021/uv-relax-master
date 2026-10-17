@@ -80,7 +80,7 @@ class UVRELAX_PT_panel(bpy.types.Panel):
     def draw(self, context):
         prefs = context.preferences.addons[ADDON_ID].preferences
         layout = self.layout
-        layout.label(text="Controller")
+        layout.label(text="Relax")
         action_box = layout.box()
         row = action_box.row(align=True)
         row.scale_y = 1.25
@@ -105,7 +105,7 @@ class UVRELAX_PT_panel(bpy.types.Panel):
         overlay_row.scale_y = 1.25
         overlay_row.prop(prefs, "overlay_on", text="Density Overlay", toggle=True,
                          icon='HIDE_OFF' if prefs.overlay_on else 'HIDE_ON')
-        layout.label(text="Transform")
+        layout.label(text="Selection & Alignment")
         controls_box = layout.box()
         controls = controls_box.row()
         direction_col = controls.column(align=True)

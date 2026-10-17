@@ -1,5 +1,6 @@
 TRANSLATIONS = {
-    ('*', 'UV Relax'): 'Relaxamento UV', ('*', 'Controller'): 'Controlador',
+    ('*', 'UV Relax'): 'Relaxamento UV', ('*', 'Relax'): 'Relaxamento',
+    ('*', 'Selection & Alignment'): 'Seleção e alinhamento', ('*', 'Controller'): 'Controlador',
     ('*', 'Transform'): 'Transformar', ('*', 'Relax Selection'): 'Relaxar seleção',
     ('*', 'Density Overlay'): 'Sobreposição de densidade', ('*', 'Select Interior'): 'Selecionar interior',
     ('*', 'Select Boundary'): 'Selecionar contorno', ('*', 'Align UV Points'): 'Alinhar pontos UV',
