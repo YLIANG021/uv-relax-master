@@ -62,6 +62,14 @@ def write(loops, uvl, uv_per_loop):
         crn[uvl].uv = uv
 
 
+def _uv_selection_flag(loop, uv_layer, shortcut, legacy):
+    """Read the UV flag through whichever BMesh API this Blender build exposes."""
+    if hasattr(loop, shortcut):
+        return bool(getattr(loop, shortcut))
+    data = loop[uv_layer] if uv_layer is not None else None
+    return bool(getattr(data, legacy, False)) if data is not None else False
+
+
 def selected_corners(bm, lt, sync, tool_settings=None):
     """Return the selected state of each UV corner in triangle order.
 
@@ -83,15 +91,26 @@ def selected_corners(bm, lt, sync, tool_settings=None):
     def flags_for_face(face, use_uv):
         loops = face.loops[:]
         if use_uv and mode == "VERT":
-            return [bool(getattr(loop, "uv_select_vert", False)) for loop in loops]
+            return [_uv_selection_flag(loop, bm.loops.layers.uv.active,
+                                       "uv_select_vert", "select") for loop in loops]
         if use_uv and mode == "EDGE":
             # A selected UV edge selects both of its endpoint corners.  Include the edge
             # entering the corner as well as the edge leaving it.
-            return [bool(getattr(loop, "uv_select_edge", False)
-                         or getattr(loops[i - 1], "uv_select_edge", False))
+            uv_layer = bm.loops.layers.uv.active
+            return [_uv_selection_flag(loop, uv_layer, "uv_select_edge", "select_edge")
+                    or _uv_selection_flag(loops[i - 1], uv_layer,
+                                          "uv_select_edge", "select_edge")
                     for i, loop in enumerate(loops)]
         if use_uv:
-            return [bool(getattr(face, "uv_select", False))] * len(loops)
+            if hasattr(face, "uv_select"):
+                selected = bool(face.uv_select)
+            else:
+                uv_layer = bm.loops.layers.uv.active
+                selected = bool(uv_layer is not None and loops and
+                                all(_uv_selection_flag(loop, uv_layer,
+                                                       "uv_select_vert", "select")
+                                    for loop in loops))
+            return [selected] * len(loops)
         if mode == "VERT":
             return [bool(loop.vert.select) for loop in loops]
         if mode == "EDGE":
@@ -124,15 +143,18 @@ def selection_counts(bm, sync):
     faces = 0
     for face in bm.faces:
         loops = face.loops[:]
-        face_selected = bool(getattr(face, "uv_select", False))
+        face_selected = (bool(face.uv_select) if hasattr(face, "uv_select") else
+                         bool(uvl is not None and loops and all(
+                             _uv_selection_flag(loop, uvl, "uv_select_vert", "select")
+                             for loop in loops)))
         for i, loop in enumerate(loops):
-            if getattr(loop, "uv_select_vert", False):
+            if _uv_selection_flag(loop, uvl, "uv_select_vert", "select"):
                 if uvl is None:
                     verts.add(loop.vert.index)
                 else:
                     uv = loop[uvl].uv
                     verts.add((loop.vert.index, round(float(uv.x), 6), round(float(uv.y), 6)))
-            if getattr(loop, "uv_select_edge", False):
+            if _uv_selection_flag(loop, uvl, "uv_select_edge", "select_edge"):
                 nxt = loops[(i + 1) % len(loops)]
                 if uvl is None:
                     a = (loop.vert.index,)
@@ -143,7 +165,8 @@ def selection_counts(bm, sync):
                     a = (loop.vert.index, round(float(ua.x), 6), round(float(ua.y), 6))
                     b = (nxt.vert.index, round(float(ub.x), 6), round(float(ub.y), 6))
                 edges.add(tuple(sorted((a, b))))
-            face_selected = (face_selected or getattr(loop, "uv_select_vert", False)
-                             or getattr(loop, "uv_select_edge", False))
+            face_selected = (face_selected
+                             or _uv_selection_flag(loop, uvl, "uv_select_vert", "select")
+                             or _uv_selection_flag(loop, uvl, "uv_select_edge", "select_edge"))
         faces += int(face_selected)
     return {"verts": len(verts), "edges": len(edges), "faces": faces}
