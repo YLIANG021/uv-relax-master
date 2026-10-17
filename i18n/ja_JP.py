@@ -1,5 +1,5 @@
 TRANSLATIONS = {
-    ('*', 'UV Relax'): 'UVリラックス', ('*', 'Relax'): 'リラックス',
+    ('*', 'Relax'): 'リラックス',
     ('*', 'Selection & Alignment'): '選択と整列', ('*', 'Controller'): 'コントローラー',
     ('*', 'Transform'): '変換', ('*', 'Relax Selection'): '選択UVをリラックス',
     ('*', 'Density Overlay'): '密度オーバーレイ', ('*', 'Select Interior'): '内部を選択',

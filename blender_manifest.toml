@@ -1,8 +1,8 @@
 schema_version = "1.0.0"
 
-id = "uv_relax"
+id = "uv_relax_master"
 version = "1.0.0"
-name = "UV Relax"
+name = "UV Relax Master"
 tagline = "Relax part of a UV island without moving what you didn't select"
 maintainer = "TODO <todo@example.com>"
 type = "add-on"

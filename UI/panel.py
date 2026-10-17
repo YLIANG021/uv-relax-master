@@ -74,8 +74,8 @@ class UVRELAX_PT_preferences(bpy.types.AddonPreferences):
 class UVRELAX_PT_panel(bpy.types.Panel):
     bl_space_type = 'IMAGE_EDITOR'
     bl_region_type = 'UI'
-    bl_category = "UV Relax"
-    bl_label = "UV Relax"
+    bl_category = "UV Relax Master"
+    bl_label = "UV Relax Master"
 
     def draw(self, context):
         prefs = context.preferences.addons[ADDON_ID].preferences
