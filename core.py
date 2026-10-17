@@ -162,6 +162,109 @@ def incident_faces(metadata, point_ids):
     return np.unique(metadata["incident_faces"][repeat_starts + within])
 
 
+def repair_single_point_flips(tl, uv, point_id, orientation, tolerance=1e-10):
+    """Move one UV point the shortest distance needed to restore its incident face winding.
+
+    With every other UV point fixed, each incident triangle's signed area is an affine
+    function of this point. Their valid regions are half-planes, so the nearest feasible
+    position is either the current point, its projection onto one constraint, or an
+    intersection of two constraints. The small candidate search is quadratic only in the
+    selected point's valence.
+    """
+    tl = np.asarray(tl, dtype=np.int64)
+    uv = np.asarray(uv, dtype=float)
+    point_id = int(point_id)
+    orientation = 1.0 if float(orientation) >= 0.0 else -1.0
+    faces = np.flatnonzero(np.any(tl == point_id, axis=1))
+    if not len(faces):
+        return uv.copy(), False
+    tri = tl[faces]
+    locations = np.argmax(tri == point_id, axis=1)
+    uv_tri = uv[tri]
+    current_area = signed_uv_area(uv_tri) * orientation
+    chart_span = max(float(np.ptp(uv, axis=0).max()), 1e-12)
+    area_floor = max(float(np.abs(current_area).max()) * 0.05,
+                     chart_span * chart_span * 1e-8)
+    if np.all(current_area >= area_floor):
+        return uv.copy(), False
+
+    origin = np.zeros(2, dtype=float)
+    ex = np.asarray((1.0, 0.0))
+    ey = np.asarray((0.0, 1.0))
+    values0 = uv_tri.copy()
+    valuesx = uv_tri.copy()
+    valuesy = uv_tri.copy()
+    rows = np.arange(len(tri))
+    values0[rows, locations] = origin
+    valuesx[rows, locations] = ex
+    valuesy[rows, locations] = ey
+    area0 = signed_uv_area(values0) * orientation
+    grad = np.stack((signed_uv_area(valuesx) * orientation - area0,
+                     signed_uv_area(valuesy) * orientation - area0), axis=1)
+    norm2 = np.einsum("ij,ij->i", grad, grad)
+    valid = norm2 > chart_span * chart_span * 1e-28
+    if not valid.all():
+        return uv.copy(), False
+    current = uv[point_id]
+    rhs = area_floor - area0
+    candidates = [current]
+    line_offset = np.einsum("ij,j->i", grad, current)
+    projected = current + ((rhs - line_offset) / norm2)[:, None] * grad
+    candidates.extend(projected)
+    for i in range(len(grad)):
+        for j in range(i + 1, len(grad)):
+            matrix = np.stack((grad[i], grad[j]))
+            det = float(np.linalg.det(matrix))
+            if abs(det) <= chart_span * chart_span * 1e-14:
+                continue
+            candidates.append(np.linalg.solve(matrix, np.asarray((rhs[i], rhs[j]))))
+
+    candidate_array = np.asarray(candidates, dtype=float)
+    feasible = (candidate_array @ grad.T) >= (rhs[None, :] - tolerance * chart_span ** 2)
+    feasible &= np.isfinite(candidate_array).all(axis=1)[:, None]
+    feasible_ids = np.flatnonzero(feasible.all(axis=1))
+    if not len(feasible_ids):
+        return uv.copy(), False
+    displacement = candidate_array[feasible_ids] - current
+    best_id = feasible_ids[np.argmin(np.einsum("ij,ij->i", displacement, displacement))]
+    if np.linalg.norm(candidate_array[best_id] - current) <= tolerance * chart_span:
+        return uv.copy(), False
+    out = uv.copy()
+    out[point_id] = candidate_array[best_id]
+    return out, True
+
+
+def local_face_quality(p, tl, uv):
+    """Return robust local shape and density scores for a small triangle patch."""
+    p = np.asarray(p, dtype=float)
+    tl = np.asarray(tl, dtype=np.int64)
+    uv = np.asarray(uv, dtype=float)
+    prepped = face_metric_prep(p)
+    shape, determinant = face_metric_uv(prepped, uv[tl])
+    area3 = 0.5 * np.linalg.norm(
+        np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), axis=1)
+    valid = np.isfinite(shape) & np.isfinite(determinant) & (area3 > 1e-30)
+    if not valid.any():
+        return (float("inf"), float("inf"))
+    weights = area3[valid]
+    values = shape[valid]
+    median = float(np.median(values))
+    p99 = float(np.percentile(values, 99))
+    density = np.abs(determinant[valid])
+    density_mean = float(np.average(density, weights=weights))
+    density_cv = float(np.sqrt(np.average(
+        (density - density_mean) ** 2, weights=weights)) / max(density_mean, 1e-30))
+    return median, max(p99, density_cv)
+
+
+def local_face_area(p, tl, uv):
+    """Return total absolute UV area for a local triangle patch."""
+    p = np.asarray(p, dtype=float)
+    tl = np.asarray(tl, dtype=np.int64)
+    uv = np.asarray(uv, dtype=float)
+    return float(0.5 * np.abs(signed_uv_area(uv[tl])).sum())
+
+
 def cached_island_references(co, tri, inv, point_isl, tuv, pos, metadata,
                              geom_p, geom_a3, limit=1, profile=None):
     """Build island-wide area, density, orientation, scale, center, and boundary data.
@@ -852,18 +955,17 @@ def _local_symmetric_dirichlet_solve(p, tl, uv0, pin, maxit, density_weight,
         values = np.asarray(v, dtype=float).reshape(-1, 2).copy()
         if axis_index is not None:
             values[:, 1 - axis_index] = 0.0
-            if loose:
-                values[:, axis_index] -= values[:, axis_index].mean()
+            if not loose:
+                return values.reshape(-1)
+            values[:, axis_index] -= values[:, axis_index].mean()
             q_axis = state[free_ids, axis_index] - scale_center[axis_index]
-            if loose:
-                q_axis = q_axis - q_axis.mean()
+            q_axis = q_axis - q_axis.mean()
             denom = float(np.dot(q_axis, q_axis))
             if denom > 1e-30:
                 values[:, axis_index] -= q_axis * (
                     float(np.dot(q_axis, values[:, axis_index])) / denom)
             return values.reshape(-1)
         q = state[free_ids] - scale_center
-        scale = q.copy()
         if loose:
             basis = np.stack((
                 np.broadcast_to((1.0, 0.0), q.shape),
@@ -872,7 +974,9 @@ def _local_symmetric_dirichlet_solve(p, tl, uv0, pin, maxit, density_weight,
                 q,
             ), axis=2).reshape(-1, 4)
         else:
-            basis = scale.reshape(-1, 1)
+            # Fixed UV points remove the chart's similarity gauge.  Translation, rotation,
+            # and scale of the free subset are real deformations and must remain available.
+            return v
         flat_basis = basis
         if not flat_basis.size:
             return v

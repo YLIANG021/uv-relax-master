@@ -241,7 +241,7 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                 selected_in_island = np.ones(len(ids), dtype=bool)
 
             if local_mode:
-                # Only UV points explicitly selected by the user may move.  All other points are
+                # Only UV points explicitly selected by the user may move. All other points are
                 # exact Dirichlet conditions, including vertices on faces touching the selection.
                 free = selected_in_island.copy()
             else:
@@ -282,6 +282,8 @@ class UVRELAX_OT_relax(bpy.types.Operator):
             solve_uv = pos[ids]
             solve_pin = ~free
             solve_kwargs = {}
+            repaired_local_point = False
+            repaired_uv = None
             reduced = local_mode
             if local_mode:
                 boundary_edges_global, boundary_lengths, boundary_count = core.island_boundary(
@@ -307,6 +309,13 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                     "boundary_3d_length_override": boundary_lengths,
                     "boundary_count_override": boundary_count,
                 }
+                if len(selected_in_labs) == 1:
+                    selected_local = int(np.searchsorted(ids, selected_in_labs[0]))
+                    solve_uv, repaired_local_point = core.repair_single_point_flips(
+                        solve_tl, solve_uv, selected_local,
+                        solve_kwargs["majority_orientation"])
+                    if repaired_local_point:
+                        repaired_uv = solve_uv.copy()
                 reduced_islands += 1
                 reduced_faces += len(f)
                 reduced_points += len(ids)
@@ -328,13 +337,30 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                 local_solver=local_mode,
                 axis=self.axis,
                 **solve_kwargs)
+            if repaired_local_point and st["pass"] > 0:
+                start_area = core.local_face_area(solve_p, solve_tl, repaired_uv)
+                result_area = core.local_face_area(solve_p, solve_tl, newuv)
+                quality_before = core.local_face_quality(solve_p, solve_tl, repaired_uv)
+                quality_after = core.local_face_quality(solve_p, solve_tl, newuv)
+                area_ratio = result_area / max(start_area, 1e-30)
+                improves_shape = (quality_after[0] < quality_before[0]
+                                  or quality_after[1] < quality_before[1])
+                if not (improves_shape and 0.65 <= area_ratio <= 1.5):
+                    newuv = repaired_uv
+                    st = {
+                        **st,
+                        "pass": 0,
+                        "solve": 0,
+                        "why": "flip repair only",
+                        "converged": True,
+                    }
             for key in solver_profile:
                 solver_profile[key] += st.get(key, 0.0)
             settled_all = settled_all and bool(st.get("converged", True))
             solver_algorithms.add(st.get("algorithm", "unknown"))
             reinitialized_islands += int(st.get("reinitialized", False))
             capped_holes += int(st.get("capped_holes", 0))
-            if st["pass"] == 0:
+            if st["pass"] == 0 and not repaired_local_point:
                 # an island whose every point is held by a face left out is a different
                 # answer from one that has settled, and saying the wrong one sends him
                 # looking for a bug that is not there

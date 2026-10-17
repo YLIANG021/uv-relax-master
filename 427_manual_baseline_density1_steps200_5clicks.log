@@ -1,0 +1,72 @@
+bl_ext.blender_org.node_pinyin addon is installed.
+Reloading external rigs...
+Reloading external metarigs...
+Registered MACHIN3tools 1.13.8.DeusEx with 24 tools, 10 pie menus
+rizomuvbridge_ultimate - INFO - Logging enabled
+register_class(...):
+警告: 'sculpt_Mask_support.piemenu' 不包含带有前缀和后缀的 '_MT_'
+找到keyconfig: Blender addon
+Registering: bl_ext.blender_org.ZenUVChecker
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+✖异常类型：RuntimeError | 异常信息：unregister_class(...):, missing bl_rna attribute from '_RNAMeta' instance (may not be registered)
+AUTORELOAD --- Setting autoreload categories
+AUTORELOAD --- Reloading external files
+00:02.328  blend            | Read blend: "C:\Users\a1910\Desktop\UV.blend"
+connectionpool - DEBUG - Starting new HTTPS connection (1): api.polyhaven.com:443
+AUTORELOAD --- Setting autoreload categories
+AUTORELOAD --- Reloading external files
+connectionpool - DEBUG - https://api.polyhaven.com:443 "GET /news/blender HTTP/1.1" 200 2
+[UV Relax] START object=Suzanne mode=SYNC selected_verts=2012 selected_edges=3978 selected_faces=1968 scope_faces=3936 islands=5 selection_source=MESH steps=200 density=1.000
+[UV Relax] DONE object=Suzanne elapsed_ms=320.7 read_ms=8.5 setup_ms=44.7 solve_ms=239.5 write_ms=2.3 post_ms=2.4 metric_ms=1.7 overlap_ms=23.3 solver_model_ms=18.0 precond_ms=3.6 cg_ms=184.0 density_line_ms=22.4 solver_misc_ms=11.5 selected_verts=2012 selected_edges=3978 selected_faces=1968 islands=5 relaxed_islands=5 reduced_islands=0 reduced_faces=0 reduced_points=0 points=2109 solves=9 cg_passes=284 overlap_fix=0->0/0 selection_source=MESH steps=200 density=1.000
+00:14.000  operator         | 2109 UV points on 5 island(s) relaxed in 321 ms | stretch median 1.323 -> 1.316, worst 1% 4.60 -> 2.57 | density CV 1.287 -> 0.685, p90/median 2.64 -> 3.44, p99/median 8.66 -> 4.03 | relaxed UV area -0.0% | 0 face(s) inside out, was 0 | 9 solve(s), 284 refinement(s)
+[UV Relax] START object=Suzanne mode=SYNC selected_verts=2012 selected_edges=3978 selected_faces=1968 scope_faces=3936 islands=5 selection_source=MESH steps=200 density=1.000
+[UV Relax] DONE object=Suzanne elapsed_ms=247.1 read_ms=8.3 setup_ms=9.6 solve_ms=213.8 write_ms=2.1 post_ms=2.1 metric_ms=1.8 overlap_ms=11.1 solver_model_ms=16.4 precond_ms=3.0 cg_ms=161.4 density_line_ms=21.7 solver_misc_ms=11.3 selected_verts=2012 selected_edges=3978 selected_faces=1968 islands=5 relaxed_islands=2 reduced_islands=0 reduced_faces=0 reduced_points=0 points=502 solves=7 cg_passes=148 overlap_fix=0->0/0 selection_source=MESH steps=200 density=1.000
+00:15.031  operator         | 502 UV points on 2 island(s) relaxed in 247 ms | stretch median 1.316 -> 1.318, worst 1% 2.57 -> 2.57 | density CV 0.685 -> 0.685, p90/median 3.44 -> 3.44, p99/median 4.03 -> 4.00 | relaxed UV area +0.0% | 0 face(s) inside out, was 0 | 7 solve(s), 148 refinement(s)
+[UV Relax] START object=Suzanne mode=SYNC selected_verts=2012 selected_edges=3978 selected_faces=1968 scope_faces=3936 islands=5 selection_source=MESH steps=200 density=1.000
+[UV Relax] DONE object=Suzanne elapsed_ms=255.5 read_ms=8.5 setup_ms=9.3 solve_ms=223.2 write_ms=2.1 post_ms=1.9 metric_ms=1.6 overlap_ms=10.3 solver_model_ms=18.3 precond_ms=3.2 cg_ms=167.7 density_line_ms=23.4 solver_misc_ms=10.6 selected_verts=2012 selected_edges=3978 selected_faces=1968 islands=5 relaxed_islands=2 reduced_islands=0 reduced_faces=0 reduced_points=0 points=502 solves=8 cg_passes=162 overlap_fix=0->0/0 selection_source=MESH steps=200 density=1.000
+00:16.109  operator         | 502 UV points on 2 island(s) relaxed in 255 ms | stretch median 1.318 -> 1.318, worst 1% 2.57 -> 2.57 | density CV 0.685 -> 0.685, p90/median 3.44 -> 3.43, p99/median 4.00 -> 4.00 | relaxed UV area -0.0% | 0 face(s) inside out, was 0 | 8 solve(s), 162 refinement(s)
+[UV Relax] START object=Suzanne mode=SYNC selected_verts=2012 selected_edges=3978 selected_faces=1968 scope_faces=3936 islands=5 selection_source=MESH steps=200 density=1.000
+[UV Relax] DONE object=Suzanne elapsed_ms=260.5 read_ms=9.8 setup_ms=10.7 solve_ms=224.6 write_ms=2.3 post_ms=1.8 metric_ms=1.5 overlap_ms=11.2 solver_model_ms=18.1 precond_ms=3.4 cg_ms=167.9 density_line_ms=23.2 solver_misc_ms=12.1 selected_verts=2012 selected_edges=3978 selected_faces=1968 islands=5 relaxed_islands=2 reduced_islands=0 reduced_faces=0 reduced_points=0 points=502 solves=9 cg_passes=159 overlap_fix=0->0/0 selection_source=MESH steps=200 density=1.000
+00:17.109  operator         | 502 UV points on 2 island(s) relaxed in 261 ms | stretch median 1.318 -> 1.318, worst 1% 2.57 -> 2.57 | density CV 0.685 -> 0.685, p90/median 3.43 -> 3.43, p99/median 4.00 -> 4.00 | relaxed UV area +0.0% | 0 face(s) inside out, was 0 | 9 solve(s), 159 refinement(s)
+[UV Relax] START object=Suzanne mode=SYNC selected_verts=2012 selected_edges=3978 selected_faces=1968 scope_faces=3936 islands=5 selection_source=MESH steps=200 density=1.000
+[UV Relax] DONE object=Suzanne elapsed_ms=250.7 read_ms=9.6 setup_ms=10.5 solve_ms=215.1 write_ms=2.3 post_ms=1.9 metric_ms=1.6 overlap_ms=11.1 solver_model_ms=17.7 precond_ms=3.3 cg_ms=159.8 density_line_ms=22.5 solver_misc_ms=11.9 selected_verts=2012 selected_edges=3978 selected_faces=1968 islands=5 relaxed_islands=2 reduced_islands=0 reduced_faces=0 reduced_points=0 points=502 solves=9 cg_passes=160 overlap_fix=0->0/0 selection_source=MESH steps=200 density=1.000
+00:17.828  operator         | 502 UV points on 2 island(s) relaxed in 251 ms | stretch median 1.318 -> 1.318, worst 1% 2.57 -> 2.57 | density CV 0.685 -> 0.685, p90/median 3.43 -> 3.43, p99/median 4.00 -> 4.00 | relaxed UV area +0.0% | 0 face(s) inside out, was 0 | 9 solve(s), 160 refinement(s)
+[UV Relax] START object=Suzanne.001 mode=SYNC selected_verts=7958 selected_edges=15828 selected_faces=7872 scope_faces=15744 islands=5 selection_source=MESH steps=200 density=1.000
+[UV Relax] DONE object=Suzanne.001 elapsed_ms=970.7 read_ms=33.5 setup_ms=36.8 solve_ms=767.3 write_ms=8.3 post_ms=6.4 metric_ms=5.3 overlap_ms=118.0 solver_model_ms=57.2 precond_ms=8.2 cg_ms=594.0 density_line_ms=74.8 solver_misc_ms=33.2 selected_verts=7958 selected_edges=15828 selected_faces=7872 islands=5 relaxed_islands=5 reduced_islands=0 reduced_faces=0 reduced_points=0 points=8153 solves=9 cg_passes=259 overlap_fix=0->0/0 selection_source=MESH steps=200 density=1.000
+00:21.719  operator         | 8153 UV points on 5 island(s) relaxed in 971 ms | stretch median 1.293 -> 1.275, worst 1% 4.63 -> 2.55 | density CV 1.296 -> 0.702, p90/median 2.62 -> 3.54, p99/median 8.87 -> 4.07 | relaxed UV area +0.0% | 0 face(s) inside out, was 0 | 9 solve(s), 259 refinement(s)
+[UV Relax] START object=Suzanne.001 mode=SYNC selected_verts=7958 selected_edges=15828 selected_faces=7872 scope_faces=15744 islands=5 selection_source=MESH steps=200 density=1.000
+[UV Relax] DONE object=Suzanne.001 elapsed_ms=1841.0 read_ms=32.6 setup_ms=36.4 solve_ms=1682.3 write_ms=7.8 post_ms=6.1 metric_ms=5.0 overlap_ms=75.5 solver_model_ms=92.0 precond_ms=13.7 cg_ms=1421.5 density_line_ms=116.7 solver_misc_ms=38.4 selected_verts=7958 selected_edges=15828 selected_faces=7872 islands=5 relaxed_islands=2 reduced_islands=0 reduced_faces=0 reduced_points=0 points=1938 solves=9 cg_passes=235 overlap_fix=0->0/0 selection_source=MESH steps=200 density=1.000
+00:23.969  operator         | 1938 UV points on 2 island(s) relaxed in 1841 ms | stretch median 1.275 -> 1.286, worst 1% 2.55 -> 2.56 | density CV 0.702 -> 0.701, p90/median 3.54 -> 3.56, p99/median 4.07 -> 4.05 | relaxed UV area -0.0% | 0 face(s) inside out, was 0 | 9 solve(s), 235 refinement(s)
+[UV Relax] START object=Suzanne.001 mode=SYNC selected_verts=7958 selected_edges=15828 selected_faces=7872 scope_faces=15744 islands=5 selection_source=MESH steps=200 density=1.000
+[UV Relax] CANCEL object=Suzanne.001 reason=nothing_relaxed elapsed_ms=1766.5 read_ms=32.7 setup_ms=36.2 solve_ms=1697.2 islands=5 reduced_islands=0 reduced_faces=0 reduced_points=0 solves=0 cg_passes=0
+[UV Relax] START object=Suzanne.001 mode=SYNC selected_verts=7958 selected_edges=15828 selected_faces=7872 scope_faces=15744 islands=5 selection_source=MESH steps=200 density=1.000
+[UV Relax] CANCEL object=Suzanne.001 reason=nothing_relaxed elapsed_ms=1773.3 read_ms=32.4 setup_ms=35.4 solve_ms=1705.2 islands=5 reduced_islands=0 reduced_faces=0 reduced_points=0 solves=0 cg_passes=0
+[UV Relax] START object=Suzanne.001 mode=SYNC selected_verts=7958 selected_edges=15828 selected_faces=7872 scope_faces=15744 islands=5 selection_source=MESH steps=200 density=1.000
+[UV Relax] CANCEL object=Suzanne.001 reason=nothing_relaxed elapsed_ms=1774.6 read_ms=32.6 setup_ms=35.4 solve_ms=1706.2 islands=5 reduced_islands=0 reduced_faces=0 reduced_points=0 solves=0 cg_passes=0
