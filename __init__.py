@@ -9,6 +9,7 @@ from .Relax import bridge, core, relax
 from .selection_tools import selection, align
 from .display import overlay
 from .UI import panel
+from . import i18n
 
 
 _handle = None
@@ -16,6 +17,7 @@ _handle = None
 
 def register():
     global _handle
+    i18n.register()
     panel.load_icons()
     for cls in panel.CLASSES:
         bpy.utils.register_class(cls)
@@ -51,3 +53,4 @@ def unregister():
     for cls in reversed(panel.CLASSES):
         bpy.utils.unregister_class(cls)
     panel.unload_icons()
+    i18n.unregister()

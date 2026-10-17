@@ -1,8 +1,13 @@
 import bmesh
 import numpy as np
 import bpy
+from bpy.app.translations import pgettext as _pgettext
 
 from ..Relax import bridge, core
+
+
+def rpt_(message):
+    return _pgettext(message, "Operator")
 
 
 def _set_uv_flag(loop, uv_layer, name, value):
@@ -104,7 +109,7 @@ class UVRELAX_OT_select_region(bpy.types.Operator):
         bm = bmesh.from_edit_mesh(me)
         got = bridge.read(bm)
         if got is None:
-            self.report({"ERROR"}, "This object has no UV map")
+            self.report({"ERROR"}, rpt_("This object has no UV map"))
             return {"CANCELLED"}
         _co, tri, lt, uvs, loops, uv_layer, _poly_of_tri = got
 
@@ -116,7 +121,7 @@ class UVRELAX_OT_select_region(bpy.types.Operator):
         selected_uv = np.zeros(len(point_islands), dtype=bool)
         np.logical_or.at(selected_uv, inv.ravel(), corner_selected.ravel())
         if not selected_uv.any():
-            self.report({"WARNING"}, "Select at least one UV point to mark an island")
+            self.report({"WARNING"}, rpt_("Select at least one UV point to mark an island"))
             return {"CANCELLED"}
 
         marked = _marked_from_current(point_islands, selected_uv)
@@ -136,6 +141,7 @@ class UVRELAX_OT_select_region(bpy.types.Operator):
 
         label = "interior" if self.region == 'INTERIOR' else "boundary"
         count = int(target.sum())
-        self.report({"INFO"}, "%d %s UV point(s) selected on %d island(s)" %
-                    (count, label, int(marked.sum())))
+        message = "%d interior UV point(s) selected on %d island(s)" if self.region == 'INTERIOR' else \
+            "%d boundary UV point(s) selected on %d island(s)"
+        self.report({"INFO"}, rpt_(message) % (count, int(marked.sum())))
         return {"FINISHED"}

@@ -4,8 +4,13 @@ import time
 import bpy
 import bmesh
 import numpy as np
+from bpy.app.translations import pgettext as _pgettext
 
 from . import core, bridge
+
+
+def rpt_(message):
+    return _pgettext(message, "Operator")
 
 
 # A bounded cache for states that were fully settled by the previous operation.  It is keyed by
@@ -132,7 +137,7 @@ class UVRELAX_OT_relax(bpy.types.Operator):
         if got is None:
             _console_log("CANCEL reason=no_uv_map elapsed_ms=%.1f" %
                          ((time.perf_counter() - t0) * 1000.0))
-            self.report({"ERROR"}, "This object has no UV map")
+            self.report({"ERROR"}, rpt_("This object has no UV map"))
             return {"CANCELLED"}
         co, tri, lt, uvs, loops, uvl, poly_of_tri = got
         tuv = uvs[lt]
@@ -162,11 +167,11 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                 (context.active_object.name, "SYNC" if sync else "UV",
                  selection["verts"], selection["edges"], selection["faces"],
                  (time.perf_counter() - t0) * 1000.0))
-            self.report({"WARNING"}, "Nothing selected in the UV editor")
+            self.report({"WARNING"}, rpt_("Nothing selected in the UV editor"))
             return {"CANCELLED"}
         if _settled_cache_hit(state):
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            self.report({"INFO"}, "Nothing relaxed: the current state is already settled")
+            self.report({"INFO"}, rpt_("Nothing relaxed: the current state is already settled"))
             _console_log("CANCEL object=%s reason=settled_cache elapsed_ms=%.1f" %
                          (context.active_object.name, elapsed_ms))
             return {"CANCELLED"}
@@ -555,8 +560,7 @@ class UVRELAX_OT_relax(bpy.types.Operator):
              reinitialized_islands, capped_holes,
              local_faces_total, local_points_total, selected_points_total,
              halo_points_total, local_rings))
-        self.report({"WARNING" if (declined or stuck or ran_out or within or across) else "INFO"},
-                    "%d UV points on %d island(s) relaxed in %.0f ms | stretch median %.3f "
+        report = ("%d UV points on %d island(s) relaxed in %.0f ms | stretch median %.3f "
                     "-> %.3f, worst 1%% %.2f -> %.2f | density CV %.3f -> %.3f, "
                     "p90/median %.2f -> %.2f, p99/median %.2f -> %.2f | "
                     "relaxed UV area %+.1f%% | %d face(s) inside out, was %d | "
@@ -568,4 +572,6 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                        density0[0], density1[0], density0[1], density1[1],
                        density0[2], density1[2],
                        100.0 * (now / was - 1.0), turn1, turn0, solves, took, tail))
+        self.report({"WARNING" if (declined or stuck or ran_out or within or across) else "INFO"},
+                    rpt_(report))
         return {"FINISHED"}

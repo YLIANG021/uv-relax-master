@@ -1,8 +1,13 @@
 import bmesh
 import bpy
 import numpy as np
+from bpy.app.translations import pgettext as _pgettext
 
 from ..Relax import bridge, core
+
+
+def rpt_(message):
+    return _pgettext(message, "Operator")
 
 
 class UVRELAX_OT_align(bpy.types.Operator):
@@ -34,20 +39,20 @@ class UVRELAX_OT_align(bpy.types.Operator):
         bm = bmesh.from_edit_mesh(context.active_object.data)
         got = bridge.read(bm)
         if got is None:
-            self.report({"ERROR"}, "This object has no UV map")
+            self.report({"ERROR"}, rpt_("This object has no UV map"))
             return {"CANCELLED"}
 
         _co, tri, lt, uvs, loops, uv_layer, _poly_of_tri = got
         sync = bool(context.tool_settings.use_uv_select_sync)
         corner_selected = bridge.selected_corners(bm, lt, sync, context.tool_settings)
         if not corner_selected.any():
-            self.report({"WARNING"}, "Select at least one UV point to align")
+            self.report({"WARNING"}, rpt_("Select at least one UV point to align"))
             return {"CANCELLED"}
 
         inv = core.uvvert_ids(tri, uvs[lt])
         selected_ids = np.unique(inv.ravel()[corner_selected.ravel()])
         if not len(selected_ids):
-            self.report({"WARNING"}, "Select at least one UV point to align")
+            self.report({"WARNING"}, rpt_("Select at least one UV point to align"))
             return {"CANCELLED"}
 
         flat_uv = uvs[lt].reshape(-1, 2)
@@ -64,6 +69,6 @@ class UVRELAX_OT_align(bpy.types.Operator):
         for area in context.screen.areas if context.screen else ():
             if area.type == "IMAGE_EDITOR":
                 area.tag_redraw()
-        self.report({"INFO"}, "%d UV point(s) aligned %s" %
+        self.report({"INFO"}, rpt_("%d UV point(s) aligned %s") %
                     (len(selected_ids), self.direction.lower()))
         return {"FINISHED"}
