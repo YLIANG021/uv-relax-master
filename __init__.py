@@ -14,10 +14,13 @@ from .display import overlay
 
 
 def _redraw_prop(self, _context):
-    # Toggling the overlay only changes whether the cached paint is shown.
+    # Apply the display preference once per toggle; user edits remain untouched until the next
+    # time the overlay is enabled.
     if self.overlay_on:
+        overlay.apply_uv_display_settings()
         overlay.invalidate_colors()
     else:
+        overlay.restore_uv_display_settings()
         overlay.drop()
 
 
@@ -115,6 +118,10 @@ def register():
                     and getattr(old, "__name__", None) == handler.__name__):
                 handlers.remove(old)
         handlers.append(handler)
+    if bpy.context.preferences.addons.get(__package__) is not None:
+        prefs = bpy.context.preferences.addons[__package__].preferences
+        if prefs.overlay_on:
+            overlay.apply_uv_display_settings()
 
 
 def unregister():
@@ -131,6 +138,7 @@ def unregister():
                 lst.remove(old)
     # the draw handler is off by now, so there is no frame to ask for -- just let the cached
     # arrays go instead of leaving a mesh's worth of vertices behind
+    overlay.restore_uv_display_settings()
     overlay.drop()
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
