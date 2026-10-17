@@ -12,6 +12,8 @@ from . import core, bridge
 # object/settings and stores only a digest of the mesh, selection, and UV state.
 _SETTLED_CACHE = {}
 _SETTLED_CACHE_LIMIT = 8
+DEFAULT_STEPS = 100
+DEFAULT_DENSITY_WEIGHT = 0.85
 
 
 def _state_digest(ob, co, tri, lt, uv, selected, sync, axis, steps, density_weight, uvl):
@@ -89,13 +91,14 @@ class UVRELAX_OT_relax(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     steps: bpy.props.IntProperty(
-        name="Steps", default=200, min=1, max=5000,
+        name="Steps", default=DEFAULT_STEPS, min=1, max=5000, options={'HIDDEN'},
         description="How many refinements one island may make inside a single solve.  The island's "
                     "shape is worked out rather than walked towards, so this only decides how exact "
                     "that answer is; raise it on a big island whose report says it ran out")
 
     density_weight: bpy.props.FloatProperty(
-        name="Density Balance", default=0.30, min=0.0, max=1.0, soft_max=0.5,
+        name="Density Balance", default=DEFAULT_DENSITY_WEIGHT, min=0.0, max=1.0,
+        soft_max=0.5, options={'HIDDEN'},
         description="How much of the island's shape relaxation is allowed to spend in order to even "
                     "out texel density, weighed against the island's own area so one setting behaves "
                     "the same on a tightly packed island and a loosely packed one.  0 keeps pure shape "

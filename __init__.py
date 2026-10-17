@@ -1,16 +1,49 @@
+import os
+
 if "bpy" in locals():
     import importlib
+    if "_icon_previews" in locals() and _icon_previews is not None:
+        bpy.utils.previews.remove(_icon_previews)
+        _icon_previews = None
     importlib.reload(core)  # noqa: F821
     importlib.reload(bridge)  # noqa: F821
     importlib.reload(relax)  # noqa: F821
     importlib.reload(selection)  # noqa: F821
+    if "align" in locals():
+        importlib.reload(align)
     from .display import overlay as _display_overlay
     importlib.reload(_display_overlay)
 
 import bpy
+import bpy.utils.previews
 
-from . import core, bridge, relax, selection
+from . import core, bridge, relax
+from .selection_tools import selection, align
 from .display import overlay
+
+
+_icon_previews = None
+_ICON_FILES = {
+    "relax_horizontal": "relax_horizontal.png",
+    "relax_vertical": "relax_vertical.png",
+}
+
+
+def _load_icon_previews():
+    global _icon_previews
+    if _icon_previews is not None:
+        return
+    previews = bpy.utils.previews.new()
+    icon_dir = os.path.join(os.path.dirname(__file__), "UI", "Icons")
+    for name, filename in _ICON_FILES.items():
+        path = os.path.join(icon_dir, filename)
+        if os.path.isfile(path):
+            previews.load(name, path, 'IMAGE')
+    _icon_previews = previews
+
+
+def _icon_value(name):
+    return _icon_previews[name].icon_id if _icon_previews and name in _icon_previews else 0
 
 
 def _redraw_prop(self, _context):
@@ -32,25 +65,8 @@ class UVRELAX_PT_preferences(bpy.types.AddonPreferences):
         "texel space it got compared to the average of the island it is on",
         update=_redraw_prop)
 
-    steps: bpy.props.IntProperty(
-        name="Steps", default=200, min=1, max=5000,
-        description="How many refinements one island may make inside a single solve.  The island's "
-                    "shape is worked out rather than walked towards, so this only decides how exact "
-                    "that answer is; raise it on a big island whose report says it ran out")
-    density_weight: bpy.props.FloatProperty(
-        name="Density Balance", default=0.30, min=0.0, max=1.0, soft_max=0.5,
-        description="How much of the island's shape relaxation is allowed to spend in order to even "
-                    "out texel density, weighed against the island's own area so one setting behaves "
-                    "the same on a tightly packed island and a loosely packed one.  0 keeps pure shape "
-                    "fidelity and leaves the packing as the unwrap left it.  Around this default the "
-                    "packing evens out and the faces keep their own shape; past about 0.5 the evenness "
-                    "is bought from the faces themselves, which start to look skewed, and under about "
-                    "0.1 the packing does not even out -- some faces keep sitting far off the island's "
-                    "average density")
     def draw(self, context):
         col = self.layout.column(align=True)
-        col.prop(self, "steps")
-        col.prop(self, "density_weight")
         col.prop(self, "overlay_on")
 
 
@@ -63,39 +79,76 @@ class UVRELAX_PT_panel(bpy.types.Panel):
     def draw(self, context):
         prefs = context.preferences.addons[__package__].preferences
         layout = self.layout
-        row = layout.row(align=True)
+        layout.label(text="Controller")
+        action_box = layout.box()
+        row = action_box.row(align=True)
+        row.scale_y = 1.25
         op = row.operator(relax.UVRELAX_OT_relax.bl_idname,
-                          text="Relax Selection", icon='UV')
-        op.steps = prefs.steps
-        op.density_weight = prefs.density_weight
+                          text="Relax Selection")
+        op.steps = relax.DEFAULT_STEPS
+        op.density_weight = relax.DEFAULT_DENSITY_WEIGHT
         # Operator properties can retain the last executed value in Blender's UI. Set the
         # main button explicitly so it always relaxes both UV axes after an X/Y-only action.
         op.axis = 'XY'
         x_op = row.operator(relax.UVRELAX_OT_relax.bl_idname,
-                            text="", icon='EVENT_X')
-        x_op.steps = prefs.steps
-        x_op.density_weight = prefs.density_weight
+                            text="", icon_value=_icon_value("relax_horizontal"))
+        x_op.steps = relax.DEFAULT_STEPS
+        x_op.density_weight = relax.DEFAULT_DENSITY_WEIGHT
         x_op.axis = 'X'
         y_op = row.operator(relax.UVRELAX_OT_relax.bl_idname,
-                            text="", icon='EVENT_Y')
-        y_op.steps = prefs.steps
-        y_op.density_weight = prefs.density_weight
+                            text="", icon_value=_icon_value("relax_vertical"))
+        y_op.steps = relax.DEFAULT_STEPS
+        y_op.density_weight = relax.DEFAULT_DENSITY_WEIGHT
         y_op.axis = 'Y'
-        layout.prop(prefs, "steps", text="Steps", slider=True)
-        layout.prop(prefs, "density_weight", text="Density Balance", slider=True)
-        box = layout.box()
-        select_row = box.row(align=True)
-        interior = select_row.operator(selection.UVRELAX_OT_select_region.bl_idname,
-                                       text="Select Interior", icon='SELECT_INTERSECT')
+        overlay_row = action_box.row(align=True)
+        overlay_row.scale_y = 1.25
+        overlay_row.prop(prefs, "overlay_on", text="Density Overlay", toggle=True,
+                         icon='HIDE_OFF' if prefs.overlay_on else 'HIDE_ON')
+        layout.label(text="Transform")
+        controls_box = layout.box()
+        controls = controls_box.row()
+        direction_col = controls.column(align=True)
+        direction_col.scale_x = 0.9
+        direction_col.scale_y = 0.9
+
+        def draw_direction_row(row, left=None, middle=None, right=None):
+            row.scale_x = 1.1
+            row.scale_y = 1.1
+            for item in (left, middle, right):
+                if item is None:
+                    # Keep the three-column geometry without adding inactive controls.
+                    row.label(text="", icon='BLANK1')
+                    continue
+                direction, icon = item
+                custom_icon = _icon_value(icon)
+                if custom_icon:
+                    op = row.operator(align.UVRELAX_OT_align.bl_idname,
+                                      text="", icon_value=custom_icon)
+                else:
+                    op = row.operator(align.UVRELAX_OT_align.bl_idname,
+                                      text="", icon=icon)
+                op.direction = direction
+
+        draw_direction_row(direction_col.row(align=True),
+                           None, ('UP', 'TRIA_UP_BAR'), None)
+        draw_direction_row(direction_col.row(align=True),
+                           ('LEFT', 'TRIA_LEFT_BAR'), None, ('RIGHT', 'TRIA_RIGHT_BAR'))
+        draw_direction_row(direction_col.row(align=True),
+                           None, ('DOWN', 'TRIA_DOWN_BAR'), None)
+
+        select_col = controls.column()
+        select_col.scale_y = 1.3
+        interior = select_col.operator(selection.UVRELAX_OT_select_region.bl_idname,
+                                       text="Select Interior", icon='STICKY_UVS_LOC')
         interior.region = 'INTERIOR'
-        boundary = select_row.operator(selection.UVRELAX_OT_select_region.bl_idname,
-                                       text="Select Boundary", icon='SELECT_SET')
+        boundary = select_col.operator(selection.UVRELAX_OT_select_region.bl_idname,
+                                       text="Select Boundary", icon='MESH_PLANE')
         boundary.region = 'BOUNDARY'
-        box.prop(prefs, "overlay_on", text="Density Overlay", icon='IMAGE_RGB')
 
 
 _classes = (relax.UVRELAX_OT_relax,
             selection.UVRELAX_OT_select_region,
+            align.UVRELAX_OT_align,
             UVRELAX_PT_preferences,
             UVRELAX_PT_panel)
 
@@ -104,6 +157,7 @@ _handle = None
 
 def register():
     global _handle
+    _load_icon_previews()
     for cls in _classes:
         bpy.utils.register_class(cls)
     _handle = bpy.types.SpaceImageEditor.draw_handler_add(
@@ -125,7 +179,7 @@ def register():
 
 
 def unregister():
-    global _handle
+    global _handle, _icon_previews
     if _handle is not None:
         bpy.types.SpaceImageEditor.draw_handler_remove(_handle, 'WINDOW')
         _handle = None
@@ -142,3 +196,6 @@ def unregister():
     overlay.drop()
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
+    if _icon_previews is not None:
+        bpy.utils.previews.remove(_icon_previews)
+        _icon_previews = None
