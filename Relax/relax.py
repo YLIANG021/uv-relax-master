@@ -93,6 +93,7 @@ class UVRELAX_OT_relax(bpy.types.Operator):
 
     bl_idname = "uv.relax_even"
     bl_label = "Relax Selection"
+    bl_description = "Relax the selected UV points while preserving unselected coordinates"
     bl_options = {"REGISTER", "UNDO"}
 
     steps: bpy.props.IntProperty(

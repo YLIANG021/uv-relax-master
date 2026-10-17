@@ -13,8 +13,9 @@ def rpt_(message):
 class UVRELAX_OT_align(bpy.types.Operator):
     """Align selected UV points to an edge of their combined bounding box."""
 
-    bl_idname = "uv_relax.align"
+    bl_idname = "uv.align_relax"
     bl_label = "Align UV Points"
+    bl_description = "Align selected UV points to the chosen edge of their bounding box"
     bl_options = {"REGISTER", "UNDO"}
 
     direction: bpy.props.EnumProperty(

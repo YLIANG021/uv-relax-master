@@ -86,8 +86,9 @@ def _boundary_points(inv, point_islands, marked):
 class UVRELAX_OT_select_region(bpy.types.Operator):
     """Select the interior or boundary UV points of islands touched by the current selection."""
 
-    bl_idname = "uv_relax.select_region"
+    bl_idname = "uv.select_region_relax"
     bl_label = "Select UV Region"
+    bl_description = "Select the interior or boundary points of the selected UV islands"
     bl_options = {"REGISTER", "UNDO"}
 
     region: bpy.props.EnumProperty(
