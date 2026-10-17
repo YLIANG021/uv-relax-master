@@ -12,7 +12,6 @@ import numpy as np
 # reused while still avoiding repeated global numpy work during ordinary UV-only edits.
 _TOPOLOGY_CACHE = {}
 _GEOMETRY_CACHE = {}
-_ISLAND_REFERENCE_CACHE = {}
 _OVERLAP_INDEX_CACHE = {}
 
 
@@ -165,18 +164,16 @@ def incident_faces(metadata, point_ids):
 
 def cached_island_references(co, tri, inv, point_isl, tuv, pos, metadata,
                              geom_p, geom_a3, limit=1, profile=None):
-    """Cache island-wide area, density, orientation, scale, center, and boundary data."""
+    """Build island-wide area, density, orientation, scale, center, and boundary data.
+
+    These references contain the current UV area, density target, center, and spread.  Because a
+    relax operation changes the UV array, a cache keyed by the complete UV state almost never
+    reuses anything; computing the small aggregate directly is cheaper than hashing four large
+    arrays and maintaining a one-entry cache.
+    """
     total_t0 = time.perf_counter()
     profile = profile if profile is not None else {}
-    profile.update(cache="miss", signature_ms=0.0, build_ms=0.0)
-    key = (_array_digest(tri), _array_digest(inv), _array_digest(tuv), _array_digest(co))
-    profile["signature_ms"] = (time.perf_counter() - total_t0) * 1000.0
-    cached = _ISLAND_REFERENCE_CACHE.get(key)
-    if cached is not None:
-        profile["cache"] = "hit"
-        profile["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
-        return cached
-
+    profile.update(cache="disabled", signature_ms=0.0, build_ms=0.0)
     build_t0 = time.perf_counter()
     face_isl = metadata["face_isl"]
     point_isl = np.asarray(point_isl, dtype=np.int64)
@@ -210,7 +207,7 @@ def cached_island_references(co, tri, inv, point_isl, tuv, pos, metadata,
     else:
         boundary_lengths = np.zeros(0, dtype=float)
     boundary_order, boundary_offsets = _group_offsets(boundary_isl, island_count)
-    cached = {
+    references = {
         "total_a3": total_a3,
         "area2": abs_area2,
         "density_target": density_target,
@@ -222,12 +219,9 @@ def cached_island_references(co, tri, inv, point_isl, tuv, pos, metadata,
         "boundary_edges": metadata["boundary_edges"],
         "boundary_lengths": boundary_lengths,
     }
-    _ISLAND_REFERENCE_CACHE[key] = cached
-    while len(_ISLAND_REFERENCE_CACHE) > limit:
-        _ISLAND_REFERENCE_CACHE.pop(next(iter(_ISLAND_REFERENCE_CACHE)))
     profile["build_ms"] = (time.perf_counter() - build_t0) * 1000.0
     profile["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
-    return cached
+    return references
 
 
 def island_boundary(metadata, references, island):
@@ -1358,10 +1352,12 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         return L, np.einsum("eij,eij->e", L, base[boundary_edges]) - err
 
     conformal_cache = {}
-    # Stop refinement only after both the UV displacement and the true objective improvement
-    # are small.  A minimum of two rounds below keeps the first correction from being truncated.
-    progress_move_tol = 1e-4
-    progress_energy_tol = 1e-4
+    # Stop refinement after either independent progress signal becomes small.  The first round is
+    # always completed; subsequent rounds only continue while the UV state or the true objective is
+    # still making a meaningful change.  These tolerances are deliberately above solver noise so
+    # the adaptive path does not collapse back into the old fixed 3+8 budget.
+    progress_move_tol = 1e-3
+    progress_energy_tol = 1e-3
 
     def system(A, w, signs, base, dens, boundary_factor=1.0):
         """The quadratic that stands in for the objective at `base`: Hessian-times-vector, the
@@ -1699,7 +1695,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             # polishing below already re-expands the model at the accepted state.
             current = base_at
             loops = 3 if symmetric_dirichlet else 1
-            stalled_rounds = 0
+            move_stalled_rounds = 0
+            energy_stalled_rounds = 0
             for round_index in range(loops):
                 local_scale = sd_scale(current)
                 local_w = w * local_scale
@@ -1735,12 +1732,16 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                 relative_move = move / max(spread, 1e-30)
                 relative_drop = max(old_energy - accepted_energy, 0.0) / max(
                     abs(old_energy), 1.0)
-                if (relative_move <= progress_move_tol
-                        and relative_drop <= progress_energy_tol):
-                    stalled_rounds += 1
+                if relative_move <= progress_move_tol:
+                    move_stalled_rounds += 1
                 else:
-                    stalled_rounds = 0
-                if round_index >= 1 and stalled_rounds >= 2:
+                    move_stalled_rounds = 0
+                if relative_drop <= progress_energy_tol:
+                    energy_stalled_rounds += 1
+                else:
+                    energy_stalled_rounds = 0
+                if round_index >= 0 and (move_stalled_rounds >= 1
+                                         or energy_stalled_rounds >= 1):
                     break
             return current
 
@@ -1760,7 +1761,8 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
             rather than a speed one.  Descent is then guaranteed by construction rather than by hoping
             the linearization reached, and a round costs one conjugate-gradient solve."""
             base = base_at
-            stalled_rounds = 0
+            move_stalled_rounds = 0
+            energy_stalled_rounds = 0
             for round_index in range(density_refine):
                 local_scale = sd_scale(base)
                 local_w = w * local_scale
@@ -1798,12 +1800,16 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
                     break
                 relative_move = float(np.abs(moved).max()) / max(spread, 1e-30)
                 relative_drop = max(e_last - accepted_value, 0.0) / max(abs(e_last), 1.0)
-                if (relative_move <= progress_move_tol
-                        and relative_drop <= progress_energy_tol):
-                    stalled_rounds += 1
+                if relative_move <= progress_move_tol:
+                    move_stalled_rounds += 1
                 else:
-                    stalled_rounds = 0
-                if round_index >= 1 and stalled_rounds >= 2:
+                    move_stalled_rounds = 0
+                if relative_drop <= progress_energy_tol:
+                    energy_stalled_rounds += 1
+                else:
+                    energy_stalled_rounds = 0
+                if round_index >= 0 and (move_stalled_rounds >= 1
+                                         or energy_stalled_rounds >= 1):
                     break
             return base
 

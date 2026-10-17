@@ -9,5 +9,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# Local benchmark output and all hidden directories
+/.test/
+.*/
+
 # Local add-on packaging script
 /Addon_pack.vbs

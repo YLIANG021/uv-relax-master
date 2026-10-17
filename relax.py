@@ -317,7 +317,10 @@ class UVRELAX_OT_relax(bpy.types.Operator):
                 # A complete island can be safely re-charted from its 3D geometry.  A partial
                 # selection must keep its current UV as the fixed-boundary problem's initial state.
                 reinitialize=(not local_mode and self.axis == 'XY'),
-                energy_mode="symmetric_dirichlet",
+                # Whole-island Symmetric Dirichlet adds several reweighted CG solves while the
+                # measured quality gain is small. Keep the faster conformal path for this A/B test;
+                # partial selections retain their dedicated local solver below.
+                energy_mode=("symmetric_dirichlet" if local_mode else "conformal"),
                 # Temporary cap faces currently alter the full-island density normalization and
                 # make repeated relax operations oscillate. Keep the stable real-face solve on the
                 # button path until virtual-hole weighting is separated from the real chart.
