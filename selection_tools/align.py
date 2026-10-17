@@ -2,7 +2,7 @@ import bmesh
 import bpy
 import numpy as np
 
-from .. import bridge, core
+from ..Relax import bridge, core
 
 
 class UVRELAX_OT_align(bpy.types.Operator):

@@ -5,7 +5,7 @@ import gpu
 import struct
 from bpy.app.handlers import persistent
 
-from .. import core, bridge
+from ..Relax import core, bridge
 
 _ADDON_PACKAGE = __package__.rpartition(".")[0]
 
@@ -239,7 +239,7 @@ def draw():
     if not objects:
         return
     addon = ctx.preferences.addons.get(_ADDON_PACKAGE)
-    if addon is None:
+    if addon is None or addon.preferences is None:
         return
     prefs = addon.preferences
     if not prefs.overlay_on:
@@ -344,7 +344,7 @@ def _schedule_refresh():
         global _refresh_fn, _dirty, _geom
         _refresh_fn = None
         addon = bpy.context.preferences.addons.get(_ADDON_PACKAGE)
-        if addon is not None and addon.preferences.overlay_on:
+        if addon is not None and addon.preferences is not None and addon.preferences.overlay_on:
             try:
                 refreshed = read_geometry()
             except Exception:

@@ -2,7 +2,7 @@ import bmesh
 import numpy as np
 import bpy
 
-from .. import bridge, core
+from ..Relax import bridge, core
 
 
 def _set_uv_flag(loop, uv_layer, name, value):

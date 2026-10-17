@@ -1250,7 +1250,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
     # grows as the SQUARE of however big the author packed the island.  Dividing it by that area is
     # what makes one Density Balance mean the same shape / evenness trade-off on a tightly packed
     # island and a loosely packed one: his mesh's islands span UV areas 0.04 to 0.36, so the single
-    # slider value was really nine different ratios (.test/sweep_norm_balance.py).  An island
+    # slider value was really nine different ratios (test/benchmarks/sweep_norm_balance.py).  An island
     # collapsed to a point has no area to divide by and no stretch to minimise either, so there the
     # weights stay as they are.
     conf_norm = 1.0 / area2_0 if area2_0 > 1e-30 else 1.0
@@ -1403,7 +1403,7 @@ def relax_solve(p, tl, uv0, pin, maxit=200, knee=2.0, density_weight=0.30,
         five times too large 25x what it charges one five times too small, so the rounds buy their
         fall by flattening the loudest outlier: on a 1872-face island whose outline wedge started at
         38.4 deg the convex stage left faces at x5.36 and x0.27, and the density stage collapsed the
-        wedge to 7.2 deg to even the big one.  `.test/probe_needle_energy.py` scores that needle
+        wedge to 7.2 deg to even the big one.  `test/benchmarks/probe_needle_energy.py` scores that needle
         0.00759 against 0.0494 for the state that kept the wedge, so the linear error did mean it --
         but the same probe says the needle was a basin, not a verdict -- the state the logarithm
         settles on (wedge 18.6 deg) is cheaper under BOTH errors.  Faces near the target are hardly
