@@ -26,7 +26,6 @@ REFRESH_INTERVAL = 0.05
 _shader = None
 # The UVO-style cache has two layers: per-object geometry/density data, and the single GPU batch
 # painted from it.
-_obj_cache = {}
 _geom = None
 _batch = None
 _vbo = None
@@ -38,6 +37,53 @@ _dirty = True
 _edit_keys = ()
 _refresh_fn = None
 _uv_display_saved = {}
+_draw_handle = globals().get("_draw_handle")
+_registered_app_handlers = globals().get("_registered_app_handlers", [])
+
+
+def _object_cache():
+    cache = getattr(_object_cache, "state", None)
+    if cache is None:
+        cache = {}
+        _object_cache.state = cache
+    return cache
+
+
+def enable_handlers():
+    """Register overlay handlers when the user enables the overlay."""
+    global _draw_handle
+    if _draw_handle is None:
+        _draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
+            draw, (), 'WINDOW', 'POST_VIEW')
+
+    for name, handler in (("depsgraph_update_post", on_depsgraph_update),
+                          ("load_post", on_load_post)):
+        handlers = getattr(bpy.app.handlers, name)
+        if handler in handlers:
+            registration = (name, handler)
+            if registration not in _registered_app_handlers:
+                _registered_app_handlers.append(registration)
+            continue
+        # Clean up this add-on's previous function object after a module reload.
+        for old in list(handlers):
+            if (getattr(old, "__module__", None) == handler.__module__
+                    and getattr(old, "__name__", None) == handler.__name__):
+                handlers.remove(old)
+        handlers.append(handler)
+        _registered_app_handlers.append((name, handler))
+
+
+def disable_handlers():
+    """Remove only handlers installed by this overlay module."""
+    global _draw_handle
+    if _draw_handle is not None:
+        bpy.types.SpaceImageEditor.draw_handler_remove(_draw_handle, 'WINDOW')
+        _draw_handle = None
+    for name, handler in _registered_app_handlers:
+        handlers = getattr(bpy.app.handlers, name)
+        if handler in handlers:
+            handlers.remove(handler)
+    _registered_app_handlers.clear()
 
 
 def get_shader():
@@ -139,7 +185,7 @@ def _build_object_geometry(ob):
         if uv_layer is None or not bm_copy.faces:
             return None, None
         current_hash = _uv_hash(bm_copy, uv_layer)
-        cached = _obj_cache.get(ob.name)
+        cached = _object_cache().get(ob.name)
         if cached and cached["hash"] == current_hash:
             return current_hash, {"geom": cached["geom"], "model": cached.get("model")}
 
@@ -163,20 +209,21 @@ def _build_object_geometry(ob):
 def read_geometry(objects=None):
     """Refresh changed objects and concatenate their cached geometry for painting."""
     objects = edited_objects() if objects is None else objects
+    obj_cache = _object_cache()
     active_names = set()
     for ob in objects:
         active_names.add(ob.name)
         current_hash, geom = _build_object_geometry(ob)
         if current_hash is not None:
-            _obj_cache[ob.name] = ({"hash": current_hash, **geom}
-                                   if geom is not None
-                                   else {"hash": current_hash, "geom": None, "model": None})
+            obj_cache[ob.name] = ({"hash": current_hash, **geom}
+                                  if geom is not None
+                                  else {"hash": current_hash, "geom": None, "model": None})
 
-    for name in list(_obj_cache):
+    for name in list(obj_cache):
         if name not in active_names:
-            del _obj_cache[name]
+            del obj_cache[name]
 
-    out = [entry["geom"] for name, entry in _obj_cache.items()
+    out = [entry["geom"] for name, entry in obj_cache.items()
            if entry.get("geom") is not None]
     return out or None
 
@@ -299,7 +346,7 @@ def apply_uv_display_settings():
             try:
                 _uv_display_saved[key] = (area, float(uv_editor.uv_opacity),
                                           str(uv_editor.edge_display_type))
-                uv_editor.uv_opacity = 0.75
+                uv_editor.uv_opacity = 1.0
                 uv_editor.edge_display_type = 'BLACK'
             except (ReferenceError, RuntimeError, TypeError):
                 _uv_display_saved.pop(key, None)
@@ -316,7 +363,7 @@ def restore_uv_display_settings():
             uv_editor = space.uv_editor
             # Restore each property independently. If the user changed one while the overlay was
             # enabled, it no longer equals our temporary value and must be left untouched.
-            if abs(float(uv_editor.uv_opacity) - 0.75) <= 1e-6:
+            if abs(float(uv_editor.uv_opacity) - 1.0) <= 1e-6:
                 uv_editor.uv_opacity = opacity
             if str(uv_editor.edge_display_type) == 'BLACK':
                 uv_editor.edge_display_type = edge_display_type
@@ -385,7 +432,10 @@ def drop():
     global _geom, _batch, _vbo, _vbo_count, _vbo_pos_id, _vbo_color_id
     global _col_key, _dirty, _edit_keys
     _cancel_refresh()
-    _obj_cache.clear()
+    cache = getattr(_object_cache, "state", None)
+    if cache is not None:
+        cache.clear()
+        _object_cache.state = None
     _geom = None
     _batch = None
     _vbo = None

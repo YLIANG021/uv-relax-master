@@ -7,12 +7,19 @@ import time
 import numpy as np
 
 
-# Small, bounded caches for data whose identity is determined by the mesh arrays.  Blender
-# recreates the arrays on edit, so the byte signatures keep stale topology or 3D metrics from being
-# reused while still avoiding repeated global numpy work during ordinary UV-only edits.
-_TOPOLOGY_CACHE = {}
-_GEOMETRY_CACHE = {}
-_OVERLAP_INDEX_CACHE = {}
+# Small, bounded caches are created on first use. Blender recreates the arrays on edit, so the
+# byte signatures keep stale topology or 3D metrics from being reused while still avoiding
+# repeated global numpy work during ordinary UV-only edits.
+def _caches():
+    state = getattr(_caches, "state", None)
+    if state is None:
+        state = {
+            "topology": {},
+            "geometry": {},
+            "overlap": {},
+        }
+        _caches.state = state
+    return state
 
 
 def _array_digest(array):
@@ -33,7 +40,8 @@ def cached_uv_topology(tri, tuv, limit=1, profile=None):
     uv_signature = _array_digest(quantized_uv)
     signature_t1 = time.perf_counter()
     profile["signature_ms"] = (signature_t1 - total_t0) * 1000.0
-    entries = _TOPOLOGY_CACHE.setdefault(key, [])
+    topology_cache = _caches()["topology"]
+    entries = topology_cache.setdefault(key, [])
     corner_uv = quantized_uv.reshape(-1, 2)
     corner_vertex = tri.reshape(-1)
     for entry_index, entry in enumerate(entries):
@@ -73,8 +81,8 @@ def cached_uv_topology(tri, tuv, limit=1, profile=None):
     entries.append((inv, point_isl, point_vertex, first_corner, metadata, uv_signature))
     while len(entries) > limit:
         entries.pop(0)
-    while len(_TOPOLOGY_CACHE) > 1:
-        _TOPOLOGY_CACHE.pop(next(iter(_TOPOLOGY_CACHE)))
+    while len(topology_cache) > 1:
+        topology_cache.pop(next(iter(topology_cache)))
     profile["build_ms"] = (time.perf_counter() - build_t0) * 1000.0
     profile["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
     return inv, point_isl, metadata
@@ -344,15 +352,16 @@ def cached_uv_geometry(co, tri, limit=1, profile=None):
     tri = np.asarray(tri)
     key = (_array_digest(co), _array_digest(tri))
     profile["signature_ms"] = (time.perf_counter() - total_t0) * 1000.0
-    cached = _GEOMETRY_CACHE.get(key)
+    geometry_cache = _caches()["geometry"]
+    cached = geometry_cache.get(key)
     if cached is None:
         build_t0 = time.perf_counter()
         p, a3 = uv3d(co, tri)
         cached = (p, a3, face_metric_prep(p))
-        _GEOMETRY_CACHE[key] = cached
+        geometry_cache[key] = cached
         profile["build_ms"] = (time.perf_counter() - build_t0) * 1000.0
-        while len(_GEOMETRY_CACHE) > limit:
-            _GEOMETRY_CACHE.pop(next(iter(_GEOMETRY_CACHE)))
+        while len(geometry_cache) > limit:
+            geometry_cache.pop(next(iter(geometry_cache)))
     else:
         profile["cache"] = "hit"
     profile["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
@@ -1993,7 +2002,8 @@ def _refresh_overlap_cache(cache, tl, u, lab, moved):
                ("refresh_ms", "candidate_ms", "sat_ms", "candidate_count",
                 "candidate_mode")}
     key = (_array_digest(tl), _array_digest(lab) if lab is not None else None)
-    spatial = _OVERLAP_INDEX_CACHE.get(key)
+    overlap_cache = _caches()["overlap"]
+    spatial = overlap_cache.get(key)
     current_uv = u[tl]
     moved_ids = (np.arange(len(tl), dtype=np.int64) if moved is None
                  else np.flatnonzero(moved))
@@ -2007,9 +2017,9 @@ def _refresh_overlap_cache(cache, tl, u, lab, moved):
         spatial = {"box": box, "area2": area2, "normals": normals,
                    "scale": np.sqrt(2.0 * np.abs(area2) / 1.7320508) + 1e-30,
                    "previous_uv": current_uv.copy(), "moved_ids": moved_ids}
-        _OVERLAP_INDEX_CACHE[key] = spatial
-        while len(_OVERLAP_INDEX_CACHE) > 1:
-            _OVERLAP_INDEX_CACHE.pop(next(iter(_OVERLAP_INDEX_CACHE)))
+        overlap_cache[key] = spatial
+        while len(overlap_cache) > 1:
+            overlap_cache.pop(next(iter(overlap_cache)))
     else:
         changed = np.flatnonzero(np.any(current_uv != spatial["previous_uv"], axis=(1, 2)))
         if len(changed):

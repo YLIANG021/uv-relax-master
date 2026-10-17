@@ -49,9 +49,11 @@ def _redraw_prop(self, _context):
     # Apply the display preference once per toggle; user edits remain untouched until the next
     # time the overlay is enabled.
     if self.overlay_on:
+        overlay.enable_handlers()
         overlay.apply_uv_display_settings()
         overlay.invalidate_colors()
     else:
+        overlay.disable_handlers()
         overlay.restore_uv_display_settings()
         overlay.drop()
 
